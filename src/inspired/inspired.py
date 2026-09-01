@@ -64,6 +64,10 @@ class INSPIRED(QMainWindow):
         self.ui.lineEdit_nmax_mlff.setText("100")
         self.ui.lineEdit_delta_mlff.setText("0.03")
 
+        self.ui.pushButton_jmol_mlff.setEnabled(False)
+        self.ui.pushButton_phononweb_mlff.setEnabled(False)
+        self.ui.checkBox_gamma_mlff.setEnabled(False)
+
     def setup_working_directory(self):
         """Set working directory
         This is the directory where all input and output files are located
@@ -385,6 +389,10 @@ class INSPIRED(QMainWindow):
         )
         self.mlff_opt = True
 
+        self.ui.pushButton_jmol_mlff.setEnabled(True)
+        self.ui.pushButton_phononweb_mlff.setEnabled(True)
+        self.ui.checkBox_gamma_mlff.setEnabled(True)
+
     def setup_oclimax_mlff(self):
         if not self.atoms_mlff:
             print("ERROR: No structure loaded.")
@@ -424,6 +432,32 @@ class INSPIRED(QMainWindow):
             zmin=self.ui.lineEdit_zmin_mlff.displayText(),
             zmax=self.ui.lineEdit_zmax_mlff.displayText(),
         )
+
+    # Visualization tools
+
+    def open_jmol(self):
+        current_tab = self.sender().objectName()
+        if current_tab == "pushButton_jmol_dft":
+            is_gamma_only = self.ui.checkBox_gamma_dft.isChecked()
+            self.dft_worker.gen_model_visualization_dft(is_gamma_only, True)
+
+        elif current_tab == "pushButton_jmol_mlff":
+            is_gamma_only = self.ui.checkBox_gamma_mlff.isChecked()
+            self.mlff_worker.gen_model_visualization_mlff(is_gamma_only, True)
+            
+
+
+    def open_phononwebsite(self):
+        current_tab = self.sender().objectName()
+        if current_tab == "pushButton_phononweb_dft":
+            is_gamma_only = self.ui.checkBox_gamma_dft.isChecked()
+            self.dft_worker.gen_model_visualization_dft(is_gamma_only, False)
+            
+
+        elif current_tab == "pushButton_phononweb_mlff":
+            is_gamma_only = self.ui.checkBox_gamma_mlff.isChecked()
+            self.mlff_worker.gen_model_visualization_mlff(is_gamma_only, False)
+            
 
     # Help dialogs in the tabs
 

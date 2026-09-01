@@ -322,7 +322,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/4f/81/021f56cdddce39a04c51abfd17af52f3fba91d30b699af5e5352f8abbff6/torch_runstats-0.2.0-py3-none-any.whl
       - pypi: https://data.pyg.org/whl/torch-2.7.0%2Bcpu/torch_scatter-2.1.2%2Bpt27cpu-cp312-cp312-linux_x86_64.whl
       - pypi: https://data.pyg.org/whl/torch-2.7.0%2Bcpu/torch_sparse-0.6.18%2Bpt27cpu-cp312-cp312-linux_x86_64.whl
-      - pypi: https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
+      - pypi: https://download-r2.pytorch.org/whl/cpu/torchaudio-2.7.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
       - pypi: https://download.pytorch.org/whl/torchmetrics-1.0.3-py3-none-any.whl
       - pypi: https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4f/a8/55325da4b240d07ba2a8e1949a05b5942dd3346e14f7fd5e3cc72e46a648/wandb-0.26.0-py3-none-manylinux_2_28_x86_64.whl
@@ -1664,8 +1664,8 @@ packages:
   timestamp: 1776068839274
 - pypi: ./
   name: inspired
-  version: 0.5.0.dev1
-  sha256: 14de4c1e06d5e2d9c305681dc33461b107e32612b577e3fa0fd565034000e2db
+  version: 0.3.0.dev81
+  sha256: b9942bb5023b15db0ab44f977386ad3985d8b1db63c5074819fcdd89cc82cd41
   requires_python: ~=3.12
 - pypi: https://files.pythonhosted.org/packages/15/aa/0aca39a37d3c7eb941ba736ede56d689e7be91cab5d9ca846bde3999eba6/isodate-0.7.2-py3-none-any.whl
   name: isodate
@@ -4533,10 +4533,12 @@ packages:
   - pytest ; extra == 'test'
   - pytest-cov ; extra == 'test'
   requires_python: '>=3.8'
-- pypi: https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
+- pypi: https://download-r2.pytorch.org/whl/cpu/torchaudio-2.7.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
   name: torchaudio
-  version: 2.11.0+cpu
-  sha256: 2354248848d06a9ae1e7a12165f800f0dda7df60ecac9fca892322b722b922c0
+  version: 2.7.1+cpu
+  sha256: 65bf843345ae05629b7f71609bab0808004dabfce6cf48ea508a5d4f5419ca74
+  requires_dist:
+  - torch==2.7.1
 - pypi: https://download.pytorch.org/whl/torchmetrics-1.0.3-py3-none-any.whl
   name: torchmetrics
   version: 1.0.3

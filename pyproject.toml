@@ -113,6 +113,8 @@ pymatgen="*"
 #including this package to allow local editable installs
 inspired = { path = ".", editable = true }
 torch = "==2.7.1"
+torchaudio = "==2.7.1"
+torchvision = "==0.22.1"
 torch-geometric = "*"
 torch-sparse = "*"
 torch-scatter = "*"

@@ -2,6 +2,7 @@ import contextlib
 import io
 import math
 import os
+import subprocess
 
 import numpy as np
 import torch
@@ -143,7 +144,7 @@ class MLFFWorker:
         print("INFO: Total number of atoms in supercell: " + str(nsc))
 
         unitcell, _ = read_crystal_structure("POSCAR-unitcell", interface_mode="vasp")
-        phonon = Phonopy(
+        self.phonon = Phonopy(
             unitcell,
             supercell_matrix=[self.nx, self.ny, self.nz],
             primitive_matrix=np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
@@ -183,8 +184,8 @@ class MLFFWorker:
 
         # Phonon calculation with phonopy
 
-        phonon.generate_displacements(distance=delta)
-        supercells = phonon.supercells_with_displacements
+        self.phonon.generate_displacements(distance=delta)
+        supercells = self.phonon.supercells_with_displacements
         ns = len(supercells)
         print("INFO: Total number of displacements: " + str(ns))
 
@@ -207,29 +208,29 @@ class MLFFWorker:
             else:
                 print("INFO: " + str(i + 1) + " of " + str(ns) + " displacements finished")
 
-        phonon.forces = sets_of_forces
-        phonon.produce_force_constants()
+        self.phonon.forces = sets_of_forces
+        self.phonon.produce_force_constants()
 
         if os.path.isfile("BORN"):
             print("INFO: BORN file found in the current folder.")
             print("INFO: Unless it is there on purpose to include NAC, please remove it.")
-            nac_params = parse_BORN(phonon.primitive, filename="BORN")
+            nac_params = parse_BORN(self.phonon.primitive, filename="BORN")
             nac_params["factor"] = 14.4
-            phonon.set_nac_params(nac_params)
+            self.phonon.set_nac_params(nac_params)
         try:
             os.remove("FORCE_SETS")
         except OSError:
             pass
         write_FORCE_CONSTANTS(
-            phonon.get_force_constants(),
-            p2s_map=phonon.primitive.get_primitive_to_supercell_map(),
+            self.phonon.get_force_constants(),
+            p2s_map=self.phonon.primitive.get_primitive_to_supercell_map(),
         )
         print("INFO: Phonon calculation finished.")
         print("INFO: Plotting phonon dispersion and DOS. For large unitcells this may take a few moments.")
         print("INFO: Frequency unit in plot is THz. 1 THz = 4.136 meV = 33.356 cm-1")
         print("INFO: Phonon DOS data will be saved in total_dos.dat file")
         with contextlib.redirect_stderr(io.StringIO()) as f:
-            bands, labels, path_connections = get_band_qpoints_by_seekpath(phonon.primitive, 1, is_const_interval=True)
+            bands, labels, path_connections = get_band_qpoints_by_seekpath(self.phonon.primitive, 1, is_const_interval=True)
         points = []
         for i in range(len(bands)):
             if i == 0 or (bands[i - 1][1] != bands[i][0]).any():
@@ -240,10 +241,10 @@ class MLFFWorker:
             print(labels[i], points[i])
 
         # To plot DOS next to band structure
-        phonon.auto_band_structure()
-        phonon.auto_total_dos()
-        phonon.write_total_dos()
-        phonon.plot_band_structure_and_dos().show()
+        self.phonon.auto_band_structure()
+        self.phonon.auto_total_dos()
+        self.phonon.write_total_dos()
+        self.phonon.plot_band_structure_and_dos().show()
 
     def generate_initial_mesh_file(self, mesh_list=[1, 1, 1]):
         """Generate mesh.conf file for MLFF calculation"""
@@ -268,3 +269,30 @@ class MLFFWorker:
             self.oclimax.use_default_mesh()
         else:
             print("INFO: Please run phonon calculation first before setting up INS calculation.")
+
+    def gen_bandyaml_for_visualization(self):
+
+        self.phonon.auto_band_structure(npoints=11, with_eigenvectors=True, write_yaml=True)
+
+    def gen_model_visualization_mlff(self, is_gamma_only=True, is_jmol=True):
+
+        # check if gamma.phonon file exists
+        if is_gamma_only and is_jmol:
+            if os.path.exists("out_gamma.phonon"):
+                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
+            else:
+                if os.path.exists("band.yaml"):
+                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
+                else:
+                    self.gen_bandyaml_for_visualization()
+                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
+
+                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
+        
+        if is_jmol == False:
+            if os.path.exists("band.yaml"):
+                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)
+
+            else:
+                self.gen_bandyaml_for_visualization()
+                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)
