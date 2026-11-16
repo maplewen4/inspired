@@ -46,6 +46,11 @@ jobs:
       - name: Install local package
         run: pixi run pip install --no-deps -e .
 
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pixi run test
+
   conda-build:
     name: Build conda package
     runs-on: ubuntu-latest

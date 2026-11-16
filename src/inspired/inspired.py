@@ -4,11 +4,13 @@ warnings.simplefilter("ignore")
 import os
 import shutil
 import sys
+import traceback
 
 from ase.formula import Formula
 from ase.io import read
 from ase.spacegroup import get_spacegroup
 from ase.visualize import view
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -16,18 +18,22 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QHeaderView,
     QMainWindow,
+    QMessageBox,
+    QProgressDialog,
 )
 
 from inspired.gui.dft_worker import DFTWorker
 from inspired.gui.dp_worker import DPWorker
 from inspired.gui.mlff_worker import MLFFWorker
 from inspired.gui.pandas_model import PandasModel
-from inspired.gui.set_paths import SetPaths
+from inspired.gui.set_paths import SetPaths, parse_path_config, user_config_path
 from inspired.gui.ui_help_dft import Ui_Help_DFT
 from inspired.gui.ui_help_dp import Ui_Help_DP
 from inspired.gui.ui_help_mlff import Ui_Help_MLFF
 from inspired.gui.ui_inspired import Ui_INSPIRED
+from inspired.mlff.backends import BACKENDS
 from inspired.version import __version__
+from inspired.visualization import PhononVisualizer, VisualizationError, VisualizationTarget
 
 
 class INSPIRED(QMainWindow):
@@ -37,7 +43,14 @@ class INSPIRED(QMainWindow):
         self.ui.setupUi(self)
         self.dp_worker = DPWorker()
         self.dft_worker = DFTWorker()
-        self.mlff_worker = MLFFWorker()
+        self.mlff_worker = MLFFWorker(self)
+        self.mlff_worker.progress.connect(self._mlff_progress)
+        self.mlff_worker.completed.connect(self._mlff_completed)
+        self.mlff_worker.failed.connect(self._mlff_failed)
+        self.mlff_worker.cancelled.connect(self._mlff_cancelled)
+        self.mlff_progress_dialog = None
+        for oclimax in (self.dft_worker.oclimax, self.mlff_worker.oclimax):
+            oclimax.simulation_finished.connect(lambda message: self.ui.statusbar.showMessage(message, 10000))
         self.set_paths = SetPaths()
         self.root_path = os.path.dirname(__file__)
         self.cwd_path = os.getcwd()
@@ -64,18 +77,28 @@ class INSPIRED(QMainWindow):
         self.ui.lineEdit_nmax_mlff.setText("100")
         self.ui.lineEdit_delta_mlff.setText("0.03")
 
-        self.ui.pushButton_jmol_mlff.setEnabled(False)
-        self.ui.pushButton_phononweb_mlff.setEnabled(False)
-        self.ui.checkBox_gamma_mlff.setEnabled(False)
+        self._set_visualization_enabled("dft", False)
+        self._set_visualization_enabled("mlff", False)
+        self.ui.comboBox_mlff_model.clear()
+        for backend in BACKENDS:
+            status = "Environment installed" if backend.available else "Setup required"
+            self.ui.comboBox_mlff_model.addItem(f"{backend.label} — {status}", backend.id)
+            index = self.ui.comboBox_mlff_model.count() - 1
+            self.ui.comboBox_mlff_model.setItemData(index, backend.setup_hint, Qt.ToolTipRole)
 
     def setup_working_directory(self):
         """Set working directory
         This is the directory where all input and output files are located
         Default is the location where inspired is started
         """
+        if self.mlff_worker.running:
+            return
         wd = QFileDialog.getExistingDirectory(self, "Working directory", "")
-        if wd:
+        if wd and os.path.realpath(wd) != os.path.realpath(self.cwd_path):
             self.cwd_path = wd
+            # Phonon files of loaded models live in the previous directory.
+            self._invalidate_dft("the working directory changed")
+            self._invalidate_mlff("the working directory changed")
         self.ui.statusbar.showMessage(f"Working directory is set to {self.cwd_path}.", 1000)
         self.ui.label_cwd.setText("Current Working Directory: " + self.cwd_path)
         os.chdir(self.cwd_path)
@@ -85,71 +108,71 @@ class INSPIRED(QMainWindow):
         Default is root dir of inspired but can be customized
         Will be saved in ~/.config/inspired
         """
-        home_path = os.path.expanduser("~")
-        user_config = os.path.join(home_path, ".config", "inspired", "config")
+        user_config = user_config_path()
         sys_config = os.path.join(self.root_path, "config")
         self.predictor_path = os.path.join(self.root_path, "model")
         self.dft_database_path = os.path.join(self.root_path, "dftdb")
-        if not os.path.isfile(user_config) and not os.path.isfile(sys_config):
-            print("INFO: config file not found, using default paths.")
-            return
-        elif not os.path.isfile(user_config) and os.path.isfile(sys_config):
-            if not os.path.exists(os.path.join(home_path, ".config", "inspired")):
-                os.makedirs(os.path.join(home_path, ".config", "inspired"))
+        if not user_config.is_file():
+            if not os.path.isfile(sys_config):
+                print("INFO: config file not found, using default paths.")
+                return
+            user_config.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(sys_config, user_config)
 
-        with open(user_config, "r") as f:
-            lines = f.readlines()
-        path_dict = {}
-        for line in lines:
-            key, value = line.split(":")
-            key = key.strip()
-            value = value.strip()
-            path_dict[key] = value
-        if "predictor_path" in path_dict and path_dict["predictor_path"] != "default":
+        path_dict = parse_path_config(user_config.read_text(encoding="utf-8"))
+        if path_dict.get("predictor_path", "default") != "default":
             self.predictor_path = path_dict["predictor_path"]
-        if "dft_database_path" in path_dict and path_dict["dft_database_path"] != "default":
+        if path_dict.get("dft_database_path", "default") != "default":
             self.dft_database_path = path_dict["dft_database_path"]
+
+    def path_problems(self):
+        """Return a description of every missing required model or database file."""
+        problems = []
+        if not os.path.isdir(self.predictor_path):
+            problems.append(f"Predictor model path does not exist: {self.predictor_path}")
+        else:
+            for dp_file in (
+                "crys_dos_predictor.torch",
+                "crys_vis_predictor.torch",
+                "latent_space_predictor.torch",
+                "decoder.pt",
+            ):
+                if not os.path.isfile(os.path.join(self.predictor_path, dp_file)):
+                    problems.append(f"Predictor model path is missing {dp_file}")
+        if not os.path.isdir(self.dft_database_path):
+            problems.append(f"DFT database path does not exist: {self.dft_database_path}")
+        elif not os.path.isfile(os.path.join(self.dft_database_path, "crystals.dat")):
+            problems.append(f"DFT database file crystals.dat was not found in {self.dft_database_path}")
+        return problems
 
     def check_paths(self):
         """Check if paths are valid
         Inspired will not run without all paths set properly
-        Will check repeatedly until all required files are found
+        Asks for new paths until all required files are found
         Users can choose to quit
         """
-        if not os.path.isdir(self.predictor_path):
-            print("ERROR: Predictor model path does not exist. Please reset in config file or Preferences in the Menu.")
-            self.set_preferences()
-        for dp_file in [
-            "crys_dos_predictor.torch",
-            "crys_vis_predictor.torch",
-            "latent_space_predictor.torch",
-            "decoder.pt",
-        ]:
-            if not os.path.isfile(os.path.join(self.predictor_path, dp_file)):
-                print(
-                    "ERROR: Predictor model path missing "
-                    + dp_file
-                    + ". Please reset in config file or Preferences in the Menu."
-                )
-                self.set_preferences()
-        if not os.path.isdir(self.dft_database_path):
-            print("ERROR: DFT database path does not exist. Please reset in config file or Preferences in the Menu.")
-            self.set_preferences()
-        if not os.path.isfile(os.path.join(self.dft_database_path, "crystals.dat")):
-            print(
-                "ERROR: DFT database file (crystals.dat) could not be found in the specified path. Please reset in config file or Preferences in the Menu."
+        while problems := self.path_problems():
+            for problem in problems:
+                print(f"ERROR: {problem}. Please reset in config file or Preferences in the Menu.")
+            QMessageBox.warning(
+                None,
+                "INSPIRED paths",
+                "INSPIRED cannot find its model and database files:\n\n" + "\n".join(problems),
             )
-            self.set_preferences()
+            self.set_paths.init_paths(self.predictor_path, self.dft_database_path)
+            if self.set_paths.exec() != QDialog.Accepted:
+                print("ERROR: Required paths were not configured. Exiting.")
+                sys.exit(1)
+            self.setup_paths()
 
     def set_preferences(self):
         """Open preferences window
         Set and check paths
         """
         self.set_paths.init_paths(self.predictor_path, self.dft_database_path)
-        self.set_paths.exec()
-        self.setup_paths()
-        self.check_paths()
+        if self.set_paths.exec() == QDialog.Accepted:
+            self.setup_paths()
+            self.check_paths()
 
     def select_structure_file(self):
         """Choose a structure file in browser
@@ -167,13 +190,12 @@ class INSPIRED(QMainWindow):
         Not supporting fractional occupancies
         Display crystal information after successful loading
         """
-        if filename.endswith(".cif"):
+        basename = os.path.basename(filename)
+        if filename.lower().endswith(".cif"):
             atoms = read(filename, format="cif")
-            occ = atoms.info["occupancy"]
-            fra = []
-            for j in list(occ.values()):
-                fra.append(float(list(j.values())[0]))
-            if min(fra) < 0.999:
+            occ = atoms.info.get("occupancy", {})
+            fra = [float(value) for site in occ.values() for value in site.values()]
+            if fra and min(fra) < 0.999:
                 print("WARNING: The structure in the CIF file must be a physical representation of the actual atoms.")
                 print(
                     "WARNING: Statistical representation in the form of fractional/partial occupancies is not supported."
@@ -181,11 +203,14 @@ class INSPIRED(QMainWindow):
                 print("WARNING: A supercell may be created to account for disorder and remove partial occupancies.")
                 print("WARNING: All partial occupancies will be treated as full atoms in the following calculations.")
 
-        elif "POSCAR" in filename or "CONTCAR" in filename:
+        elif "POSCAR" in basename or "CONTCAR" in basename or basename.lower().endswith(".vasp"):
             atoms = read(filename, format="vasp")
         else:
             print("ERROR: File format not supported yet (currently support cif and VASP format)")
-            return
+            return None
+        if not all(atoms.pbc) or atoms.cell.volume <= 0:
+            print("ERROR: The structure must be a periodic crystal with a unit cell.")
+            return None
         if atoms:
             sg = get_spacegroup(atoms)
             form = atoms.get_chemical_formula()
@@ -208,6 +233,9 @@ class INSPIRED(QMainWindow):
         if fname:
             try:
                 self.atoms_dp = self.read_structure_file(fname)
+                if self.atoms_dp is None:
+                    self.ui.statusbar.showMessage(f"Could not load {fname}. See the terminal for details.", 10000)
+                    return
                 self.ui.label_structure_dp.setText(f"Structure file: {fname}")
                 self.ui.statusbar.showMessage("")
             except Exception as e:
@@ -276,8 +304,10 @@ class INSPIRED(QMainWindow):
         self.ui.pushButton_dft_folder.setEnabled(True)
 
     def choose_dft_folder(self):
-        self.userdft_path = QFileDialog.getExistingDirectory(self, "User DFT directory", "")
-        self.ui.label_dft_folder.setText("DFT folder: " + self.userdft_path)
+        selected_path = QFileDialog.getExistingDirectory(self, "User DFT directory", "")
+        if selected_path:
+            self.userdft_path = selected_path
+            self.ui.label_dft_folder.setText("DFT folder: " + self.userdft_path)
 
     def search_crystal_structure(self):
         search_type = self.ui.comboBox_search_type.currentText()
@@ -287,14 +317,21 @@ class INSPIRED(QMainWindow):
         self.ui.tableView.setModel(PandasModel(self.show_df))
 
     def load_dft_model(self):
+        self.atoms_dft = None
+        self._set_visualization_enabled("dft", False)
         if self.ui.radioButton_database.isChecked():
             mp_dfindex = self.ui.tableView.currentIndex().row()
+            if mp_dfindex < 0:
+                self._show_visualization_error("Select a DFT database result before loading the model.")
+                return
             mp_id = self.show_df.iat[mp_dfindex, 0]
             filename = os.path.join(self.dft_database_path, mp_id, "POSCAR-unitcell")
             self.dft_worker.prepare_dft_files(self.cwd_path, self.dft_database_path, mp_id)
         elif self.ui.radioButton_user_dft.isChecked():
             filename = os.path.join(self.userdft_path, "POSCAR-unitcell")
             self.dft_worker.prepare_dft_files(self.cwd_path, self.userdft_path)
+        # The DFT files just replaced any MLFF phonon results in the working directory.
+        self._invalidate_mlff("DFT files were copied into the working directory")
         try:
             self.atoms_dft = read(filename, format="vasp")
         except:
@@ -312,6 +349,7 @@ class INSPIRED(QMainWindow):
             print("INFO: Number of atoms in cell: ", len(self.atoms_dft.numbers))
             print("INFO: Chemical formula: ", Formula(form).reduce()[0])
             print("INFO: Space group: ", sg.no, sg.symbol)
+            self._set_visualization_enabled("dft", True)
 
     def view_structure_dft(self):
         if self.atoms_dft:
@@ -335,7 +373,7 @@ class INSPIRED(QMainWindow):
 
     def run_oclimax_dft(self):
         if self.atoms_dft:
-            self.dft_worker.oclimax.run_oclimax()
+            self.dft_worker.oclimax.run_oclimax(parent=self)
         else:
             print("ERROR: Select and load model file first.")
 
@@ -358,9 +396,14 @@ class INSPIRED(QMainWindow):
     def upload_structure_mlff(self):
         fname = self.select_structure_file()
         if fname:
+            self.atoms_mlff = None
+            self.mlff_opt = False
+            self._set_visualization_enabled("mlff", False)
             try:
                 self.atoms_mlff = self.read_structure_file(fname)
-                self.mlff_opt = False
+                if self.atoms_mlff is None:
+                    self.ui.statusbar.showMessage(f"Could not load {fname}. See the terminal for details.", 10000)
+                    return
                 self.ui.label_structure_mlff.setText(f"Structure file: {fname}")
                 self.ui.statusbar.showMessage("")
             except Exception as e:
@@ -373,25 +416,103 @@ class INSPIRED(QMainWindow):
             print("ERROR: Select structure file first.")
 
     def opt_and_dos_cal_mlff(self):
+        if self.mlff_worker.running:
+            self.mlff_worker.cancel()
+            return
         if not self.atoms_mlff:
             print("ERROR: No structure loaded.")
             return
-        self.mlff_worker.run_opt_and_dos(
-            self.atoms_mlff,
-            potential_index=self.ui.comboBox_mlff_model.currentIndex(),
-            use_specific_model=self.ui.checkBox_mlff_model.isChecked(),
-            mlff_model_name=self.ui.lineEdit_mlff_model_name.displayText(),
-            lmin=self.ui.lineEdit_lmin_mlff.displayText(),
-            fmax=self.ui.lineEdit_fmax_mlff.displayText(),
-            nmax=self.ui.lineEdit_nmax_mlff.displayText(),
-            delta=self.ui.lineEdit_delta_mlff.displayText(),
-            relax_cell=self.ui.checkBox_relax_cell.isChecked(),
-        )
-        self.mlff_opt = True
+        self.mlff_opt = False
+        self._set_visualization_enabled("mlff", False)
+        try:
+            custom = self.ui.checkBox_mlff_model.isChecked()
+            model = self.ui.lineEdit_mlff_model_name.text().strip() if custom else None
+            if custom and not model:
+                raise ValueError("Select a custom model file or uncheck the custom model option.")
+            self.mlff_worker.start(
+                self.atoms_mlff, self.ui.comboBox_mlff_model.currentData(), self.cwd_path,
+                model=model,
+                lmin=self.ui.lineEdit_lmin_mlff.text(),
+                fmax=self.ui.lineEdit_fmax_mlff.text(),
+                nmax=self.ui.lineEdit_nmax_mlff.text(),
+                delta=self.ui.lineEdit_delta_mlff.text(),
+                relax_cell=self.ui.checkBox_relax_cell.isChecked(),
+            )
+        except (ValueError, RuntimeError, OSError) as error:
+            QMessageBox.warning(self, "MLFF setup", str(error))
+            return
+        self._set_mlff_busy(True)
+        self.mlff_progress_dialog = QProgressDialog("Starting model environment…", "Cancel", 0, 0, self)
+        self.mlff_progress_dialog.setWindowTitle("MLFF calculation")
+        self.mlff_progress_dialog.setAutoClose(False)
+        self.mlff_progress_dialog.canceled.connect(self.mlff_worker.cancel)
+        self.mlff_progress_dialog.show()
 
-        self.ui.pushButton_jmol_mlff.setEnabled(True)
-        self.ui.pushButton_phononweb_mlff.setEnabled(True)
-        self.ui.checkBox_gamma_mlff.setEnabled(True)
+    def _set_mlff_busy(self, busy):
+        for name in ("pushButton_upload_structure_mlff", "groupBox_6", "actionSet_CWD",
+                     "pushButton_setup_oclimax_mlff", "pushButton_run_oclimax_mlff", "pushButton_plot_mlff"):
+            getattr(self.ui, name).setEnabled(not busy)
+        for tab in (self.ui.DFTtab, self.ui.PREDtab):
+            self.ui.tabWidget.setTabEnabled(self.ui.tabWidget.indexOf(tab), not busy)
+        self.ui.pushButton_opt_phonon_mlff.setText(
+            "Cancel calculation" if busy else "Structure optimization + Phonon calculation"
+        )
+
+    def _mlff_progress(self, message):
+        print(message, end="", flush=True)
+        lines = message.strip().splitlines()
+        if lines:
+            self.ui.statusbar.showMessage(lines[-1][:250])
+            if self.mlff_progress_dialog:
+                self.mlff_progress_dialog.setLabelText(lines[-1][:250])
+
+    def _finish_mlff_ui(self):
+        self._set_mlff_busy(False)
+        if self.mlff_progress_dialog:
+            self.mlff_progress_dialog.close()
+            self.mlff_progress_dialog.deleteLater()
+            self.mlff_progress_dialog = None
+
+    def _mlff_completed(self, result):
+        self._finish_mlff_ui()
+        # MLFF output replaced FORCE_CONSTANTS and removed FORCE_SETS of a loaded DFT model.
+        self._invalidate_dft("MLFF results replaced the phonon files in the working directory")
+        self.mlff_opt = True
+        self.atoms_mlff = read(os.path.join(self.cwd_path, "POSCAR-unitcell"), format="vasp")
+        self._set_visualization_enabled("mlff", True)
+        self.ui.statusbar.showMessage(f"{result['backend']} calculation complete. Results saved in {self.cwd_path}", 10000)
+        try:
+            self.mlff_worker.plot_results()
+        except Exception as error:
+            QMessageBox.warning(self, "Plot unavailable", f"Calculation completed, but the plot could not be opened: {error}")
+
+    def _mlff_failed(self, message):
+        self._finish_mlff_ui()
+        self.mlff_opt = False
+        self._set_visualization_enabled("mlff", False)
+        self.ui.statusbar.showMessage("MLFF calculation failed. See the job log.", 10000)
+        QMessageBox.warning(self, "MLFF calculation failed", message)
+
+    def _mlff_cancelled(self):
+        self._finish_mlff_ui()
+        self.mlff_opt = False
+        self._set_visualization_enabled("mlff", False)
+        self.ui.statusbar.showMessage("MLFF calculation cancelled. Previous output files were preserved.", 10000)
+
+    def closeEvent(self, event):
+        running = False
+        if self.mlff_worker.running:
+            self.mlff_worker.cancel()
+            running = True
+        for oclimax in (self.dft_worker.oclimax, self.mlff_worker.oclimax):
+            if oclimax.running:
+                oclimax.process.cancel()
+                running = True
+        if running:
+            self.ui.statusbar.showMessage("Stopping the calculation. Close the window again once it has stopped.")
+            event.ignore()
+        else:
+            event.accept()
 
     def setup_oclimax_mlff(self):
         if not self.atoms_mlff:
@@ -418,7 +539,7 @@ class INSPIRED(QMainWindow):
         if not self.mlff_opt:
             print("ERROR: Must run structure optimization and phonon calculation first.")
             return
-        self.mlff_worker.oclimax.run_oclimax()
+        self.mlff_worker.oclimax.run_oclimax(parent=self)
 
     def plot_spec_mlff(self):
         self.mlff_worker.oclimax.plot_spec(
@@ -433,31 +554,64 @@ class INSPIRED(QMainWindow):
             zmax=self.ui.lineEdit_zmax_mlff.displayText(),
         )
 
+    def _invalidate_dft(self, reason):
+        if self.atoms_dft is not None:
+            print(f"INFO: DFT model unloaded because {reason}. Load it again to continue in the DFT tab.")
+        self.atoms_dft = None
+        self._set_visualization_enabled("dft", False)
+
+    def _invalidate_mlff(self, reason):
+        if self.mlff_opt:
+            print(f"INFO: MLFF results unloaded because {reason}. Rerun the calculation to continue in the MLFF tab.")
+        self.mlff_opt = False
+        self._set_visualization_enabled("mlff", False)
+
     # Visualization tools
 
+    def _set_visualization_enabled(self, workflow, enabled):
+        """Enable visualization actions only when their source data is ready."""
+        getattr(self.ui, f"pushButton_jmol_{workflow}").setEnabled(enabled)
+        getattr(self.ui, f"pushButton_phononweb_{workflow}").setEnabled(enabled)
+
+    def _visualization_context(self):
+        sender = self.sender()
+        sender_name = sender.objectName() if sender is not None else ""
+        if sender_name.endswith("_dft"):
+            if self.atoms_dft is None:
+                raise VisualizationError("Load a DFT model before opening a visualization.")
+            return self.dft_worker, ("POSCAR-unitcell", "FORCE_CONSTANTS", "FORCE_SETS", "BORN", "mesh.conf")
+        if sender_name.endswith("_mlff"):
+            if not self.mlff_opt:
+                raise VisualizationError("Complete the MLFF phonon calculation before opening a visualization.")
+            return self.mlff_worker, ("POSCAR-unitcell", "FORCE_CONSTANTS", "BORN")
+        raise VisualizationError("Could not determine which calculation should be visualized.")
+
+    def _open_visualization(self, target):
+        try:
+            worker, source_files = self._visualization_context()
+            result = PhononVisualizer(self.cwd_path).visualize(
+                target,
+                worker.generate_band_yaml,
+                source_files=source_files,
+            )
+        except VisualizationError as error:
+            self._show_visualization_error(str(error))
+            return
+        print(f"INFO: {result.message}")
+        self.ui.statusbar.showMessage(result.message, 10000)
+
+    def _show_visualization_error(self, message):
+        print(f"ERROR: {message}")
+        self.ui.statusbar.showMessage(message, 10000)
+        QMessageBox.warning(self, "Visualization unavailable", message)
+
     def open_jmol(self):
-        current_tab = self.sender().objectName()
-        if current_tab == "pushButton_jmol_dft":
-            is_gamma_only = self.ui.checkBox_gamma_dft.isChecked()
-            self.dft_worker.gen_model_visualization_dft(is_gamma_only, True)
-
-        elif current_tab == "pushButton_jmol_mlff":
-            is_gamma_only = self.ui.checkBox_gamma_mlff.isChecked()
-            self.mlff_worker.gen_model_visualization_mlff(is_gamma_only, True)
-            
-
+        """Open Gamma-point vibration modes in Jmol."""
+        self._open_visualization(VisualizationTarget.JMOL)
 
     def open_phononwebsite(self):
-        current_tab = self.sender().objectName()
-        if current_tab == "pushButton_phononweb_dft":
-            is_gamma_only = self.ui.checkBox_gamma_dft.isChecked()
-            self.dft_worker.gen_model_visualization_dft(is_gamma_only, False)
-            
-
-        elif current_tab == "pushButton_phononweb_mlff":
-            is_gamma_only = self.ui.checkBox_gamma_mlff.isChecked()
-            self.mlff_worker.gen_model_visualization_mlff(is_gamma_only, False)
-            
+        """Open the Phonon Website with a current band.yaml ready to upload."""
+        self._open_visualization(VisualizationTarget.PHONON_WEBSITE)
 
     # Help dialogs in the tabs
 
@@ -480,27 +634,15 @@ class INSPIRED(QMainWindow):
         help_mlff.exec()
 
 
-if __name__ == "__main__":
-    print("********************************************************************************************************")
-    print("* Inelastic Neutron Scattering Prediction for Instantaneous Results and Experimental Design (INSPIRED) *")
-    print("********************************************************************************************************")
-    print(f"INFO: version {__version__}")
-    print("INFO: Initializing ...")
-    app = QApplication(sys.argv)
-    main_window = INSPIRED()
-    print("INFO: Starting GUI ...")
-    main_window.show()
-    print("INFO: Ready. Set your working directory in Menu, or use current directory by default.")
-    print(
-        "INFO: It is strongly recommended that a new/empty directory is created/assigned as working directory for each project."
-    )
-    print(
-        "INFO: Existing files from a previous/different model in the working directory may interfere with the calculation and lead to incorrect results."
-    )
-    print(
-        "INFO: If you choose not to change working directory for multiple calculations, please follow through all steps for each calculation (do not skip steps)."
-    )
-    sys.exit(app.exec_())
+def _report_unhandled_exception(exc_type, exc_value, exc_traceback):
+    """Keep the GUI alive: PyQt5 otherwise aborts the application on any error in a slot."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"ERROR: Unexpected error\n{details}", file=sys.stderr)
+    if QApplication.instance() is not None:
+        QMessageBox.critical(None, "INSPIRED error", f"{exc_type.__name__}: {exc_value}\n\nSee the terminal for details.")
 
 
 def gui():
@@ -518,6 +660,7 @@ def gui():
     print("********************************************************************************************************")
     print(f"INFO: version {__version__}")
     print("INFO: Initializing ...")
+    sys.excepthook = _report_unhandled_exception
     app = QApplication(sys.argv)
     main_window = INSPIRED()
     print("INFO: Starting GUI ...")
@@ -533,3 +676,7 @@ def gui():
         "INFO: If you choose not to change working directory for multiple calculations, please follow through all steps for each calculation (do not skip steps)."
     )
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    gui()

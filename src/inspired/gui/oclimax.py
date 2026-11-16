@@ -1,19 +1,142 @@
+import codecs
 import csv
-import glob
+import json
 import os
-import subprocess
-import time
+import signal
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-from qtpy.QtWidgets import QDialog, QFileDialog
+from qtpy.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, Signal
+from qtpy.QtWidgets import QDialog, QFileDialog, QMessageBox, QProgressDialog
 
+from inspired.gui import oclimax_job
 from inspired.gui.oclimax_params import OclimaxParams
 from inspired.gui.ui_help_oclimax import Ui_Help_OCLIMAX
 from inspired.gui.ui_oclimax import Ui_OCLIMAX
 
 
+class OclimaxProcess(QObject):
+    """Run ``inspired.gui.oclimax_job`` asynchronously and translate its output into signals."""
+
+    progress = Signal(int, int, str)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None, *, python=sys.executable):
+        super().__init__(parent)
+        self.python = python
+        self.process = None
+        self._cancelling = False
+        self._decoder = None
+        self._buffer = ""
+        self._errors = []
+        self._tail = []
+        self._result = None
+
+    @property
+    def running(self):
+        return self.process is not None
+
+    def start(self, request, workdir, tools_dir):
+        if self.running:
+            raise RuntimeError("An INS simulation is already running.")
+        self._cancelling = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._buffer = ""
+        self._errors, self._tail, self._result = [], [], None
+        process = QProcess(self)
+        process.setWorkingDirectory(str(workdir))
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
+        process.readyReadStandardOutput.connect(self._read_output)
+        process.finished.connect(self._finished)
+        process.errorOccurred.connect(self._process_error)
+        self.process = process
+        process.start(
+            self.python,
+            ["-u", "-m", "inspired.gui.oclimax_job", "--request", json.dumps(request), "--tools", str(tools_dir)],
+        )
+
+    def cancel(self):
+        """Stop the job and the OCLIMAX binaries it started, escalating to kill after a grace period."""
+        if not self.running:
+            return
+        self._cancelling = True
+        process = self.process
+        self._signal_group(process, signal.SIGTERM)
+        QTimer.singleShot(2000, lambda: self.process is process and self._signal_group(process, signal.SIGKILL))
+
+    @staticmethod
+    def _signal_group(process, signum):
+        # The job leads its own process group (os.setsid), which includes oclimax_run/oclimax_convert.
+        pid = process.processId()
+        if pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signum)
+                return
+            except OSError:
+                pass  # not (yet) a group leader, or already gone
+        if process.state() != QProcess.NotRunning:
+            process.kill() if signum == getattr(signal, "SIGKILL", None) else process.terminate()
+
+    def _read_output(self):
+        if self.process is None:
+            return
+        self._buffer += self._decoder.decode(bytes(self.process.readAllStandardOutput()))
+        *lines, self._buffer = self._buffer.split("\n")
+        for line in lines:
+            self._handle_line(line)
+
+    def _handle_line(self, line):
+        if line.startswith("PROGRESS "):
+            counts, _, message = line[len("PROGRESS ") :].partition(" ")
+            done, _, total = counts.partition("/")
+            print(f"INFO: [{done}/{total}] {message}", flush=True)
+            self.progress.emit(int(done), int(total), message)
+            return
+        if line.startswith("RESULT "):
+            self._result = line[len("RESULT ") :].strip()
+            return
+        print(line, flush=True)
+        if line.startswith("ERROR:"):
+            self._errors.append(line[len("ERROR:") :].strip())
+        self._tail = (self._tail + [line])[-20:]
+
+    def _process_error(self, error):
+        if self.process is not None and error == QProcess.FailedToStart:
+            message = self.process.errorString()
+            self._cleanup()
+            self.failed.emit(f"Could not start the INS simulation: {message}")
+
+    def _cleanup(self):
+        process, self.process = self.process, None
+        if process is not None:
+            process.deleteLater()
+        return process
+
+    def _finished(self, exit_code, exit_status):
+        self._read_output()
+        if self._buffer:
+            self._handle_line(self._buffer)
+            self._buffer = ""
+        process = self._cleanup()
+        if self._cancelling:
+            # Make sure no binary outlives a cancelled job.
+            self._signal_group(process, getattr(signal, "SIGKILL", signal.SIGTERM))
+            self.cancelled.emit()
+        elif exit_status == QProcess.NormalExit and exit_code == 0 and self._result:
+            self.completed.emit(self._result)
+        else:
+            self.failed.emit("\n".join(self._errors) or "\n".join(self._tail) or f"Exit code {exit_code}.")
+
+
 class OCLIMAX(QDialog):
+    simulation_finished = Signal(str)
+
     def __init__(self):
         super(OCLIMAX, self).__init__()
         self.ui = Ui_OCLIMAX()
@@ -21,7 +144,14 @@ class OCLIMAX(QDialog):
         self.oclimax_params = OclimaxParams()
         self.params_file_name = "oclimax.params"
         self.csv_file_name = None
-        self.oclimax_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "oclimax")
+        self.oclimax_path = oclimax_job.TOOLS_DIR
+        self.progress_dialog = None
+        self._dialog_parent = None
+        self.process = OclimaxProcess(self)
+        self.process.progress.connect(self._job_progress)
+        self.process.completed.connect(self._job_completed)
+        self.process.failed.connect(self._job_failed)
+        self.process.cancelled.connect(self._job_cancelled)
 
         self.enable_disable_single_crystal_parameters(False)
 
@@ -210,453 +340,66 @@ class OCLIMAX(QDialog):
         if self.ui.comboBox_Eunit.currentIndex() == 1:
             return
 
-    def run_oclimax(self):
-        if not os.path.isfile("POSCAR-unitcell"):
-            print("ERROR: POSCAR-unitcell file in working directory is required for this calculation.")
+    @property
+    def running(self):
+        return self.process.running
+
+    def run_oclimax(self, parent=None):
+        """Validate the inputs, then run the simulation in a cancellable background process."""
+        if self.running:
             return
-        if not os.path.isfile("mesh.conf"):
-            print("ERROR: mesh.conf file in working directory is required for this calculation.")
+        request = {
+            "params": dict(self.oclimax_params.dict_params),
+            "params_file": self.params_file_name,
+            "bscale": self.ui.lineEdit_bscale.displayText(),
+        }
+        try:
+            oclimax_job.validate(request)
+        except ValueError as error:
+            for line in str(error).splitlines():
+                print(f"ERROR: {line}")
+            QMessageBox.warning(parent, "INS simulation", str(error))
             return
-        if not (os.path.isfile("FORCE_SETS") or os.path.isfile("FORCE_CONSTANTS")):
-            print("ERROR: FORCE_SETS or FORCE_CONSTANTS file is required for this calculation.")
-            return
-        if os.path.isfile("FORCE_SETS") and os.path.isfile("FORCE_CONSTANTS"):
-            print("WARNING: Found both FORCE_SETS and FORCE_CONSTANTS files. Inconsistency issue possible.")
-        task = self.oclimax_params.get_param("TASK")
-        if task == 0 or task == 1:
-            timestr = time.strftime("%Y%m%d-%H%M%S")
-            print("INFO: Running phonopy calculation. Press Ctrl+C in terminal to abort.")
-            try:
-                subprocess.run(["phonopy", "-c", "POSCAR-unitcell", "mesh.conf"], text=True)  # run phononpy
-            except:
-                print("ERROR: Phonopy calculation failed or terminated.")
-                return
-            print(
-                "INFO: Phonopy calculation finished. Running file format conversion. Press Ctrl+C in terminal to abort."
-            )
-            try:
-                subprocess.run(
-                    [
-                        os.path.join(self.oclimax_path, "oclimax_convert"),
-                        "-yaml",
-                        "mesh.yaml",
-                        "-o",
-                        "oclimax_" + timestr,
-                    ],
-                    text=True,
-                )
-            except:
-                print("ERROR: File format conversion failed or terminated.")
-                return
-            print("INFO: File converted. Running OCLIMAX simulation. Press Ctrl+C in terminal to abort.")
-            try:
-                subprocess.run(
-                    [
-                        os.path.join(self.oclimax_path, "oclimax_run"),
-                        "oclimax_" + timestr + ".oclimax",
-                        self.params_file_name,
-                    ],
-                    text=True,
-                )
-            except:
-                print("ERROR: OCLIMAX simulation failed or terminated.")
-                return
-            generated_csv = glob.glob("oclimax_" + timestr + "*K.csv")
-            self.csv_file_name = generated_csv[0]
-            print("INFO: OCLIMAX simulation finished. Output file: " + self.csv_file_name)
+        dialog = QProgressDialog("Starting INS simulation…", "Cancel", 0, 0, parent)
+        dialog.setWindowTitle("INS simulation (OCLIMAX)")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.canceled.connect(self.process.cancel)
+        self.progress_dialog = dialog
+        self._dialog_parent = parent
+        print("INFO: INS simulation started. Use Cancel in the progress window to stop it.")
+        self.process.start(request, os.getcwd(), self.oclimax_path)
+        dialog.show()
 
-        else:
-            self.run_oclimax_sc()
+    def _job_progress(self, done, total, message):
+        if self.progress_dialog is not None:
+            self.progress_dialog.setMaximum(total)
+            self.progress_dialog.setValue(done)
+            self.progress_dialog.setLabelText(message)
 
-    def run_oclimax_sc(self):
-        timestr = time.strftime("%Y%m%d-%H%M%S")
-        task = self.oclimax_params.get_param("TASK")
-        Q1 = self.oclimax_params.get_param("Q1").split()
-        Q2 = self.oclimax_params.get_param("Q2").split()
-        Q3 = self.oclimax_params.get_param("Q3").split()
-        Qb1 = self.oclimax_params.get_param("Q1bin").split()
-        Qb2 = self.oclimax_params.get_param("Q2bin").split()
-        Qb3 = self.oclimax_params.get_param("Q3bin").split()
-        HKL = list(map(float, self.oclimax_params.get_param("HKL").split()))
-        Eb = self.oclimax_params.get_param("Ebin").split()
-        for param in [Q1, Q2, Q3, Qb1, Qb2, Qb3]:
-            if len(param) != 3:
-                print(
-                    'ERROR: Check Q and Q_bin parameters (each should have three numbers, click "Help" for more information)'
-                )
-                return
-        for param in [Qb1, Qb2, Qb3]:
-            if float(param[0]) > float(param[2]):
-                print("ERROR: Check Qbin parameters ([Qmin,Qstep,Qmax])")
-                return
-            if float(param[1]) < 0:
-                print("ERROR: Check Qbin parameters (Qstep cannot be negative)")
-                return
-            if float(param[1]) == 0:
-                if float(param[0]) != float(param[2]):
-                    print("ERROR: Check Qbin parameters (Qstep can be zero only if Qmin=Qmax)")
-                    return
-                else:
-                    param[1] = 1
-        if len(Eb) != 3:
-            if task == 3 and len(Eb) == 2:
-                if float(Eb[1]) > float(Eb[0]):
-                    Eb = np.array(
-                        [
-                            float(Eb[0]),
-                            (float(Eb[1]) - float(Eb[0])) / 2.0,
-                            float(Eb[1]),
-                        ]
-                    )
-                else:
-                    print("ERROR: Check E_bin parameters (Emax must be greater than Emin)")
-                    return
-            else:
-                print("ERROR: Check E_bin parameters ([Emin,Estep,Emax] for the task)")
-                return
-        else:
-            if float(Eb[2]) <= float(Eb[0]):
-                print("ERROR: Check E_bin parameters (Emax must be greater than Emin)")
-                return
-            if float(Eb[1]) <= 0:
-                print("ERROR: Check E_bin parameters (Estep must be greater than zero)")
-                return
-            Eb = np.array([float(Eb[0]), float(Eb[1]), float(Eb[2])])
-        Q = np.array(
-            [
-                [float(Q1[0]), float(Q1[1]), float(Q1[2])],
-                [float(Q2[0]), float(Q2[1]), float(Q2[2])],
-                [float(Q3[0]), float(Q3[1]), float(Q3[2])],
-            ]
-        )
-        Qb = np.array(
-            [
-                [float(Qb1[0]), float(Qb1[1]), float(Qb1[2])],
-                [float(Qb2[0]), float(Qb2[1]), float(Qb2[2])],
-                [float(Qb3[0]), float(Qb3[1]), float(Qb3[2])],
-            ]
-        )
-        bscale = float(self.ui.lineEdit_bscale.displayText())
-        print("INFO: BAND_POINTS scaling factor set to " + str(bscale))
-        dim = subprocess.run(["sed -n '/^DIM/p' mesh.conf"], shell=True, capture_output=True, text=True).stdout
-        # S(Q,E)
-        print(
-            "INFO: Running OCLIMAX simulation for single crystals, expect multiple calculation cycles. Press Ctrl+C in terminal to abort."
-        )
-        if task == 2:
-            xaxis = self.oclimax_params.get_param("x-axis")
-            s = [0, 1, 2]
-            s.remove(xaxis)
+    def _close_progress(self):
+        if self.progress_dialog is not None:
+            self.progress_dialog.close()
+            self.progress_dialog.deleteLater()
+            self.progress_dialog = None
 
-            Qx = Q[xaxis]
-            Qxb = Qb[xaxis]
-            qQ1 = Q[s[0]]
-            qQ2 = Q[s[1]]
+    def _job_completed(self, result):
+        self._close_progress()
+        self.csv_file_name = result
+        self.simulation_finished.emit(f"INS simulation finished: {result}")
 
-            try:
-                result = subprocess.run(["phonopy", "-c", "POSCAR-unitcell", "mesh.conf"], text=True)  # run phononpy
-            except:
-                print("ERROR: Phonopy calculation failed or terminated.")
-                return
-            print("INFO: Converting data format")
-            try:
-                result = subprocess.run(
-                    [
-                        os.path.join(self.oclimax_path, "oclimax_convert"),
-                        "-yaml",
-                        "mesh.yaml",
-                        "-o",
-                        "mesh",
-                    ],
-                    text=True,
-                )
-            except:
-                print("ERROR: File format conversion failed or terminated.")
-                return
-            q1 = np.linspace(
-                Qb[s[0]][0],
-                Qb[s[0]][2],
-                int(round((Qb[s[0]][2] - Qb[s[0]][0]) / Qb[s[0]][1])) + 1,
-            )
-            q2 = np.linspace(
-                Qb[s[1]][0],
-                Qb[s[1]][2],
-                int(round((Qb[s[1]][2] - Qb[s[1]][0]) / Qb[s[1]][1])) + 1,
-            )
+    def _job_failed(self, message):
+        self._close_progress()
+        print(f"ERROR: INS simulation failed. {message}")
+        self.simulation_finished.emit("INS simulation failed. See the terminal for details.")
+        QMessageBox.warning(self._dialog_parent, "INS simulation failed", message)
 
-            count = 0
-            npoint = max(
-                int(bscale * 1.0 / Qxb[1]) + 1,
-                int(bscale * (Eb[2] - Eb[0]) / Eb[1]) + 1,
-            )
-            for i in range(len(q1)):
-                for j in range(len(q2)):
-                    count += 1
-                    print("INFO: Running cycle " + str(count) + " of " + str(len(q1) * len(q2)))
-                    f = open("band.conf", "w")
-                    print(dim, file=f)
-                    p1 = -0.5 * Qx + q1[i] * qQ1 + q2[j] * qQ2
-                    p2 = q1[i] * qQ1 + q2[j] * qQ2
-                    p3 = 0.5 * Qx + q1[i] * qQ1 + q2[j] * qQ2
-                    p4 = p2 + HKL[0] * Q[0] + HKL[1] * Q[1] + HKL[2] * Q[2]
-                    print(
-                        "BAND = ",
-                        p1[0],
-                        p1[1],
-                        p1[2],
-                        p2[0],
-                        p2[1],
-                        p2[2],
-                        p3[0],
-                        p3[1],
-                        p3[2],
-                        file=f,
-                    )
-                    print("BAND_POINTS = ", npoint, file=f)
-                    print("# bscale " + str(bscale), file=f)
-                    print("FC_SYMMETR= TRUE", file=f)
-                    print("EIGENVECTORS = .true.", file=f)
-                    if os.path.isfile("FORCE_CONSTANTS"):
-                        print("FORCE_CONSTANTS = read", file=f)
-                    if os.path.isfile("BORN"):
-                        print("NAC = .true.", file=f)
-                    f.close()
-                    try:
-                        result = subprocess.run(["phonopy", "-c", "POSCAR-unitcell", "band.conf"], text=True)
-                    except:
-                        print("ERROR: Phonopy calculation failed or terminated.")
-                        return
-                    print("INFO: Converting data format")
-                    try:
-                        result = subprocess.run(
-                            [
-                                os.path.join(self.oclimax_path, "oclimax_convert"),
-                                "-yamld",
-                                "band.yaml",
-                                "-o",
-                                "band_" + timestr,
-                            ],
-                            text=True,
-                        )
-                    except:
-                        print("ERROR: File format conversion failed or terminated.")
-                        return
-
-                    f = open("oclimax-sc.params", "w")
-                    print("TASK    =         2", file=f)
-                    print("INSTR   =         3", file=f)
-                    print("TEMP    =     ", self.oclimax_params.get_param("TEMP"), file=f)
-                    print(
-                        "E_UNIT  =     ",
-                        self.oclimax_params.get_param("E_UNIT"),
-                        file=f,
-                    )
-                    print(
-                        "OUTPUT  =     ",
-                        self.oclimax_params.get_param("OUTPUT"),
-                        file=f,
-                    )
-                    print("MAXO    =     ", self.oclimax_params.get_param("MAXO"), file=f)
-                    print("MASK    =     ", self.oclimax_params.get_param("MASK"), file=f)
-                    print("NORM    =     ", self.oclimax_params.get_param("NORM"), file=f)
-                    print("MINE    =     ", Eb[0], file=f)
-                    print("MAXE    =     ", Eb[2], file=f)
-                    print("dE      =     ", Eb[1], file=f)
-                    print("ECUT    =     ", self.oclimax_params.get_param("ECUT"), file=f)
-                    print("ERES    =     ", self.oclimax_params.get_param("ERES"), file=f)
-                    print("MINQ    =     ", Qxb[0], file=f)
-                    print("MAXQ    =     ", Qxb[2], file=f)
-                    print("dQ      =     ", Qxb[1], file=f)
-                    print("QRES    =     ", self.oclimax_params.get_param("QRES"), file=f)
-                    print("THETA   =     ", self.oclimax_params.get_param("THETA"), file=f)
-                    print("Ei      =     ", self.oclimax_params.get_param("Ei"), file=f)
-                    print("HKL     =     ", p4[0], p4[1], p4[2], file=f)
-                    print("Q_vec   =     ", Qx[0], Qx[1], Qx[2], file=f)
-                    f.close()
-                    outfile = "cut_qe_" + timestr + "_" + str(i) + "_" + str(j) + ".csv"
-                    try:
-                        result = subprocess.run(
-                            [
-                                os.path.join(self.oclimax_path, "oclimax_run"),
-                                "mesh.oclimax",
-                                "oclimax-sc.params",
-                                "band_" + timestr + ".oclimax",
-                            ],
-                            text=True,
-                        )
-                    except:
-                        print("ERROR: OCLIMAX simulation failed or terminated.")
-                        return
-                    generated_csv = glob.glob("band_" + timestr + "_2Dmesh_scqw_*K.csv")
-                    result = subprocess.run(["mv", generated_csv[0], outfile])
-
-            all_cut_csv = glob.glob("cut_qe_" + timestr + "*.csv")
-            print("INFO: Integrating cuts")
-            try:
-                result = subprocess.run(
-                    [
-                        "python",
-                        os.path.join(self.oclimax_path, "merge_csv.py"),
-                        "oclimax_sc_qe_" + timestr,
-                    ]
-                    + all_cut_csv,
-                    text=True,
-                )
-            except:
-                print("ERROR: Merging files failed or terminated.")
-                return
-            generated_csv = glob.glob("oclimax_sc_qe_" + timestr + "*.csv")
-
-        # S(Q1,Q2)
-        if task == 3:
-            xaxis = self.oclimax_params.get_param("x-axis")
-            yaxis = self.oclimax_params.get_param("y-axis") - 1
-            s = [0, 1, 2]
-            s.remove(xaxis)
-            s.remove(yaxis)
-
-            Qx = Q[xaxis]
-            Qy = Q[yaxis]
-            Qxb = Qb[xaxis]
-            Qyb = Qb[yaxis]
-            qQ1 = Q[s[0]]
-
-            try:
-                result = subprocess.run(["phonopy", "-c", "POSCAR-unitcell", "mesh.conf"], text=True)  # run phononpy
-            except:
-                print("ERROR: Phonopy calculation failed or terminated.")
-                return
-            print("INFO: Converting data format")
-            try:
-                result = subprocess.run(
-                    [
-                        os.path.join(self.oclimax_path, "oclimax_convert"),
-                        "-yaml",
-                        "mesh.yaml",
-                        "-o",
-                        "mesh",
-                    ],
-                    text=True,
-                )
-            except:
-                print("ERROR: File format conversion failed or terminated.")
-                return
-            q1 = np.linspace(
-                Qb[s[0]][0],
-                Qb[s[0]][2],
-                int(round((Qb[s[0]][2] - Qb[s[0]][0]) / Qb[s[0]][1]) + 1),
-            )
-            # print(q1)
-
-            for i in range(len(q1)):
-                print("INFO: Running cycle " + str(i + 1) + " of " + str(len(q1)))
-                f = open("QPOINTS", "w")
-                qx = np.linspace(-0.5, 0.5, int(bscale * 1.0 / Qxb[1]) + 1)
-                qy = np.linspace(-0.5, 0.5, int(bscale * 1.0 / Qyb[1]) + 1)
-                print(len(qx) * len(qy), file=f)
-                shft = q1[i] * qQ1
-                p4 = shft + HKL[0] * Q[0] + HKL[1] * Q[1] + HKL[2] * Q[2]
-                for j in range(len(qx)):
-                    for k in range(len(qy)):
-                        qp = qx[j] * Qx + qy[k] * Qy + shft
-                        print(qp[0], qp[1], qp[2], file=f)
-                f.close()
-
-                f = open("band.conf", "w")
-                print(dim, file=f)
-                print("QPOINTS = .TRUE.", file=f)
-                print("FC_SYMMETR= TRUE", file=f)
-                print("EIGENVECTORS = .true.", file=f)
-                if os.path.isfile("FORCE_CONSTANTS"):
-                    print("FORCE_CONSTANTS = read", file=f)
-                if os.path.isfile("BORN"):
-                    print("NAC = .true.", file=f)
-                f.close()
-                try:
-                    result = subprocess.run(["phonopy", "-c", "POSCAR-unitcell", "band.conf"], text=True)
-                except:
-                    print("ERROR: Phonopy calculation failed or terminated.")
-                    return
-                print("INFO: Converting data format")
-                try:
-                    result = subprocess.run(
-                        [
-                            os.path.join(self.oclimax_path, "oclimax_convert"),
-                            "-vpd",
-                            "POSCAR-unitcell",
-                            "qpoints.yaml",
-                            "-o",
-                            "band_" + timestr,
-                        ],
-                        text=True,
-                    )
-                except:
-                    print("ERROR: File format conversion failed or terminated.")
-                    return
-
-                f = open("oclimax-sc.params", "w")
-                print("TASK    =         3", file=f)
-                print("INSTR   =         3", file=f)
-                print("TEMP    =     ", self.oclimax_params.get_param("TEMP"), file=f)
-                print("E_UNIT  =     ", self.oclimax_params.get_param("E_UNIT"), file=f)
-                print("OUTPUT  =     ", self.oclimax_params.get_param("OUTPUT"), file=f)
-                print("MAXO    =     ", self.oclimax_params.get_param("MAXO"), file=f)
-                print("MASK    =     ", self.oclimax_params.get_param("MASK"), file=f)
-                print("NORM    =     ", self.oclimax_params.get_param("NORM"), file=f)
-                print("MINE    =     ", Eb[0], file=f)
-                print("MAXE    =     ", Eb[2], file=f)
-                print("dE      =     ", Eb[1], file=f)
-                print("ECUT    =     ", self.oclimax_params.get_param("ECUT"), file=f)
-                print("ERES    =     ", self.oclimax_params.get_param("ERES"), file=f)
-                print("MINQ    =     ", Qxb[0], file=f)
-                print("MAXQ    =     ", Qxb[2], file=f)
-                print("dQ      =     ", Qxb[1], file=f)
-                print("QRES    =     ", self.oclimax_params.get_param("QRES"), file=f)
-                print("THETA   =     ", self.oclimax_params.get_param("THETA"), file=f)
-                print("Ei      =     ", self.oclimax_params.get_param("Ei"), file=f)
-                print("HKL     =     ", p4[0], p4[1], p4[2], file=f)
-                print("Q_vec   =     ", Qx[0], Qx[1], Qx[2], file=f)
-                print("Q_vec_y =     ", Qy[0], Qy[1], Qy[2], file=f)
-                print("MINQ_y  =     ", Qyb[0], file=f)
-                print("MAXQ_y  =     ", Qyb[2], file=f)
-                print("dQ_y    =     ", Qyb[1], file=f)
-                f.close()
-
-                outfile = "cut_qq_" + timestr + "_" + str(i) + ".csv"
-                try:
-                    result = subprocess.run(
-                        [
-                            os.path.join(self.oclimax_path, "oclimax_run"),
-                            "mesh.oclimax",
-                            "oclimax-sc.params",
-                            "band_" + timestr + ".oclimax",
-                        ],
-                        text=True,
-                    )
-                except:
-                    print("ERROR: OCLIMAX simulation failed or terminated.")
-                    return
-                generated_csv = glob.glob("band_" + timestr + "_2Dmesh_scqq_*K.csv")
-                result = subprocess.run(["mv", generated_csv[0], outfile])
-
-            all_cut_csv = glob.glob("cut_qq_" + timestr + "*.csv")
-            print("INFO: Integrating cuts")
-            try:
-                result = subprocess.run(
-                    [
-                        "python",
-                        os.path.join(self.oclimax_path, "merge_csv.py"),
-                        "oclimax_sc_qq_" + timestr,
-                    ]
-                    + all_cut_csv,
-                    text=True,
-                )
-            except:
-                print("ERROR: Merging files failed or terminated.")
-                return
-            generated_csv = glob.glob("oclimax_sc_qq_" + timestr + "*.csv")
-        self.csv_file_name = generated_csv[0]
-        print("INFO: OCLIMAX simulation finished. Output file: " + self.csv_file_name)
+    def _job_cancelled(self):
+        self._close_progress()
+        print("INFO: INS simulation cancelled. The previous result is kept for plotting.")
+        self.simulation_finished.emit("INS simulation cancelled.")
 
     def plot_spec(
         self,
@@ -674,7 +417,12 @@ class OCLIMAX(QDialog):
             print("ERROR: No result to plot. Please run INS simulation first.")
             return
 
-        sim = list(csv.reader(open(self.csv_file_name, "r")))
+        try:
+            with open(self.csv_file_name, "r") as csv_file:
+                sim = list(csv.reader(csv_file))
+        except OSError as error:
+            print(f"ERROR: Could not read simulation result {self.csv_file_name}: {error}")
+            return
 
         TASK = sim[2][0].split("#")[1]
         INSTR = sim[2][1]
@@ -885,8 +633,11 @@ class OCLIMAX(QDialog):
 
                         v_line.set_xdata([cur_x, cur_x])
                         h_line.set_ydata([cur_y, cur_y])
-                        v_prof.set_xdata(Z[:, int((cur_x - x_min) / dx)])
-                        h_prof.set_ydata(Z[int((cur_y - y_min) / dy), :])
+                        # Clamp so the cursor at the plot edge cannot index past the data.
+                        col = min(max(int((cur_x - x_min) / dx), 0), Z.shape[1] - 1)
+                        row = min(max(int((cur_y - y_min) / dy), 0), Z.shape[0] - 1)
+                        v_prof.set_xdata(Z[:, col])
+                        h_prof.set_ydata(Z[row, :])
 
                         fig.canvas.draw_idle()
 

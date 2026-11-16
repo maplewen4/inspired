@@ -1,0 +1,16 @@
+[workspace]
+name = "inspired-sevennet"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+phonopy = "==2.28.0"
+seekpath = "*"
+
+[pypi-dependencies]
+sevenn = "==0.12.1"
+torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cpu" }
+
+[activation.env]
+OMP_NUM_THREADS = "1"

@@ -1,0 +1,22 @@
+[workspace]
+name = "inspired-mattersim"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+phonopy = "==2.28.0"
+seekpath = "*"
+# mp-api's boto3 dependency requires dateutil < 3; avoid falling back to
+# obsolete maggma/pyzmq builds that do not support Python 3.12.
+python-dateutil = ">=2.8,<3"
+pyzmq = ">=26"
+
+[pypi-dependencies]
+mattersim = "==1.2.2"
+torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cpu" }
+torchaudio = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cpu" }
+torchvision = { version = "==0.22.1", index = "https://download.pytorch.org/whl/cpu" }
+
+[activation.env]
+OMP_NUM_THREADS = "1"

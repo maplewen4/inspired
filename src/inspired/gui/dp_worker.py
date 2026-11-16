@@ -465,8 +465,11 @@ class DPWorker:
 
                         v_line.set_xdata([cur_x, cur_x])
                         h_line.set_ydata([cur_y, cur_y])
-                        v_prof.set_xdata(Z[:, int((cur_x - x_min) / dx)])
-                        h_prof.set_ydata(Z[int((cur_y - y_min) / dy), :])
+                        # Clamp so the cursor at the plot edge cannot index past the data.
+                        col = min(max(int((cur_x - x_min) / dx), 0), Z.shape[1] - 1)
+                        row = min(max(int((cur_y - y_min) / dy), 0), Z.shape[0] - 1)
+                        v_prof.set_xdata(Z[:, col])
+                        h_prof.set_ydata(Z[row, :])
 
                         fig.canvas.draw_idle()
 

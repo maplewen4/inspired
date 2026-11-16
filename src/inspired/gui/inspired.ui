@@ -411,26 +411,22 @@ li.checked::marker { content: &quot;\2612&quot;; }
                 <number>5</number>
                </property>
                <item>
-                <widget class="QCheckBox" name="checkBox_gamma_dft">
-                 <property name="text">
-                  <string>Gamma only</string>
-                 </property>
-                 <property name="checked">
-                  <bool>true</bool>
-                 </property>
-                </widget>
-               </item>
-               <item>
                 <widget class="QPushButton" name="pushButton_jmol_dft">
+                 <property name="toolTip">
+                  <string>Open Gamma-point vibration modes in Jmol</string>
+                 </property>
                  <property name="text">
-                  <string>Jmol</string>
+                  <string>Open in Jmol (Gamma point)</string>
                  </property>
                 </widget>
                </item>
                <item>
                 <widget class="QPushButton" name="pushButton_phononweb_dft">
+                 <property name="toolTip">
+                  <string>Open the Phonon Website with band.yaml ready to upload</string>
+                 </property>
                  <property name="text">
-                  <string>Phonon website</string>
+                  <string>Open Phonon Website</string>
                  </property>
                 </widget>
                </item>
@@ -837,26 +833,22 @@ li.checked::marker { content: &quot;\2612&quot;; }
                 <number>5</number>
                </property>
                <item>
-                <widget class="QCheckBox" name="checkBox_gamma_mlff">
-                 <property name="text">
-                  <string>Gamma only</string>
-                 </property>
-                 <property name="checked">
-                  <bool>true</bool>
-                 </property>
-                </widget>
-               </item>
-               <item>
                 <widget class="QPushButton" name="pushButton_jmol_mlff">
+                 <property name="toolTip">
+                  <string>Open Gamma-point vibration modes in Jmol</string>
+                 </property>
                  <property name="text">
-                  <string>Jmol</string>
+                  <string>Open in Jmol (Gamma point)</string>
                  </property>
                 </widget>
                </item>
                <item>
                 <widget class="QPushButton" name="pushButton_phononweb_mlff">
+                 <property name="toolTip">
+                  <string>Open the Phonon Website with band.yaml ready to upload</string>
+                 </property>
                  <property name="text">
-                  <string>Phonon website</string>
+                  <string>Open Phonon Website</string>
                  </property>
                 </widget>
                </item>

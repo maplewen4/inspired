@@ -1,298 +1,176 @@
-import contextlib
-import io
-import math
+"""Qt controller for MLFF calculations in independent Python environments."""
+
+import codecs
 import os
-import subprocess
+import shutil
+import tempfile
+from pathlib import Path
 
-import numpy as np
-import torch
-from ase import Atoms
-from ase.filters import ExpCellFilter
-
-# from ase.phonons import Phonons
+import phonopy
 from ase.io import write
-from ase.optimize import FIRE
-from phonopy import Phonopy
-from phonopy.file_IO import parse_BORN, write_FORCE_CONSTANTS
-from phonopy.interface.calculator import read_crystal_structure
-from phonopy.phonon.band_structure import get_band_qpoints_by_seekpath
+from qtpy.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from inspired.gui.oclimax import OCLIMAX
+from inspired.mlff.backends import get_backend
+from inspired.mlff.protocol import ARTIFACTS, PROTOCOL_VERSION, calculation_options, read_result, write_json
+from inspired.phonon_plot import plot_band_structure_and_dos
 
 
-class MLFFWorker:
-    def __init__(self):
+class MLFFWorker(QObject):
+    """Own one asynchronous job and publish successful calculation output."""
+
+    progress = Signal(str)
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None, *, runner_path=None):
+        super().__init__(parent)
         self.oclimax = OCLIMAX()
         self.nx = self.ny = self.nz = None
+        self.phonon = None
+        self.process = None
+        self.job_dir = None
+        self.workdir = None
+        self._cancelling = False
+        self._decoder = None
+        self._log = None
+        self._tail = ""
+        self._runner_path = Path(runner_path) if runner_path else Path(__file__).parents[1] / "mlff" / "runner.py"
 
-    def run_opt_and_dos(
-        self,
-        struc=None,
-        potential_index=0,
-        use_specific_model=False,
-        mlff_model_name=None,
-        lmin=12.0,
-        fmax=0.01,
-        nmax=100,
-        delta=0.03,
-        relax_cell=False,
-    ):
-        """Structure optimization and phonon calculation with MLFF"""
-        try:
-            lmin = float(lmin.strip())
-        except:
-            try:
-                lmin = list(map(int, lmin.strip().split()))
-            except:
-                lmin = 12.0
-        try:
-            fmax = float(fmax)
-        except:
-            fmax = 0.001
-        try:
-            nmax = int(nmax)
-        except:
-            nmax = 100
-        try:
-            delta = float(delta)
-        except:
-            delta = 0.03
-        abc = struc.cell.cellpar()[0:3]
-        if not isinstance(lmin, list):
-            nx = math.ceil(lmin / abc[0])  # calculate default mesh in BZ based on cell size
-            ny = math.ceil(lmin / abc[1])
-            nz = math.ceil(lmin / abc[2])
-        elif len(lmin) == 3:
-            nx = lmin[0]
-            ny = lmin[1]
-            nz = lmin[2]
-        else:
-            print("ERROR: Check Lmin/Dim. Must be one float number or three integers.")
+    @property
+    def running(self):
+        return self.process is not None
+
+    def start(self, structure, backend_id, workdir, *, model=None, device="auto", **options):
+        """Launch the selected environment's Python in a private job directory."""
+        if self.running:
+            raise RuntimeError("An MLFF calculation is already running.")
+        backend = get_backend(backend_id)
+        if not backend.available:
+            raise ValueError(f"{backend.label} needs its own environment.\nRun:\n{backend.setup_hint}")
+        validated = calculation_options(**options)
+        self.workdir = Path(workdir).resolve()
+        if model:
+            model = str(Path(model).expanduser().resolve())
+            if not Path(model).is_file():
+                raise ValueError(f"Custom model file does not exist: {model}")
+        if model and backend.id == "orb":
+            raise ValueError("Custom checkpoints for ORB are not supported yet.")
+        jobs_root = self.workdir / ".inspired-jobs"
+        jobs_root.mkdir(exist_ok=True)
+        self.job_dir = Path(tempfile.mkdtemp(prefix=f"{backend.id}-", dir=jobs_root))
+        write(self.job_dir / "input.extxyz", structure, format="extxyz")
+        if (self.workdir / "BORN").is_file():
+            shutil.copy2(self.workdir / "BORN", self.job_dir / "BORN")
+        write_json(self.job_dir / "request.json", {
+            "protocol_version": PROTOCOL_VERSION, "backend": backend.id,
+            "model": model, "device": device, "options": validated,
+        })
+        self.phonon = None
+        self._cancelling = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._tail = ""
+        self._log = (self.job_dir / "worker.log").open("w", encoding="utf-8")
+        process = QProcess(self)
+        process.setWorkingDirectory(str(self.job_dir))
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        environment = QProcessEnvironment.systemEnvironment()
+        for variable in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "LD_LIBRARY_PATH"):
+            environment.remove(variable)
+        environment.insert("PATH", str(backend.python.parent) + os.pathsep + os.environ.get("PATH", ""))
+        environment.insert("OMP_NUM_THREADS", "1")
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
+        process.readyReadStandardOutput.connect(self._read_output)
+        process.finished.connect(self._finished)
+        process.errorOccurred.connect(self._process_error)
+        self.process = process
+        process.start(str(backend.python), ["-u", str(self._runner_path), "--request", str(self.job_dir / "request.json")])
+
+    def cancel(self):
+        """Terminate the worker, escalating to kill after a short grace period."""
+        if not self.running:
             return
-        self.nx = nx
-        self.ny = ny
-        self.nz = nz
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        print("INFO: Running structural optimization...")
-        if potential_index == 0:  # MatterSim
-            from mattersim.forcefield.potential import MatterSimCalculator
+        self._cancelling = True
+        process = self.process
+        process.terminate()
+        QTimer.singleShot(2000, lambda: self._kill_if_running(process))
 
-            torch.set_default_dtype(torch.float32)
-            if use_specific_model and mlff_model_name is not None:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = MatterSimCalculator(load_path=mlff_model_name, device=device)
-            else:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = MatterSimCalculator(load_path="MatterSim-v1.0.0-5M.pth", device=device)
-        elif potential_index == 1:  # SevenNet
-            from sevenn.calculator import SevenNetCalculator
+    def _kill_if_running(self, process):
+        if self.process is process and process.state() != QProcess.NotRunning:
+            process.kill()
 
-            torch.set_default_dtype(torch.float32)
-            if use_specific_model and mlff_model_name is not None:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = SevenNetCalculator(model=mlff_model_name, device=device)
-            else:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = SevenNetCalculator(model="7net-mf-ompa", modal="mpa", device=device)
-        '''
-        elif potential_index == 2:  # ORB v3
-            from orb_models.forcefield import pretrained
-            from orb_models.forcefield.calculator import ORBCalculator
+    def _read_output(self):
+        if self.process is None:
+            return
+        message = self._decoder.decode(bytes(self.process.readAllStandardOutput()))
+        if message:
+            self._log.write(message)
+            self._log.flush()
+            self._tail = (self._tail + message)[-4000:]
+            self.progress.emit(message)
 
-            with contextlib.redirect_stderr(io.StringIO()) as f:
-                orbff = pretrained.orb_v3_conservative_inf_omat(device=device, precision="float32-high")
-            calculator = ORBCalculator(orbff, device=device)
-        elif potential_index == 3:  # MACE
-            from mace.calculators import mace_mp
+    def _process_error(self, error):
+        if self.process is not None and error == QProcess.FailedToStart:
+            message = self.process.errorString()
+            self._cleanup()
+            self.failed.emit(f"Could not start the model environment: {message}")
 
-            if use_specific_model and mlff_model_name is not None:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = mace_mp(model=mlff_model_name, default_dtype="float64", device=device)
-            else:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = mace_mp(model="medium-mpa-0", default_dtype="float64", device=device)
-        elif potential_index == 4:  # MACE-OFF
-            from mace.calculators import mace_off
+    def _cleanup(self):
+        process, self.process = self.process, None
+        if self._log:
+            self._log.close()
+            self._log = None
+        if process:
+            process.deleteLater()
 
-            if use_specific_model and mlff_model_name is not None:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = mace_off(model=mlff_model_name, default_dtype="float64", device=device)
-            else:
-                with contextlib.redirect_stderr(io.StringIO()) as f:
-                    calculator = mace_off(model="medium", default_dtype="float64", device=device)
-        '''
-        struc.set_calculator(calculator)
-        if relax_cell:
-            ecf = ExpCellFilter(struc)
-            dyn = FIRE(ecf)
-        else:
-            dyn = FIRE(struc)
+    def _finished(self, exit_code, exit_status):
+        self._read_output()
+        self._cleanup()
+        if self._cancelling:
+            self.cancelled.emit()
+            return
+        if exit_status != QProcess.NormalExit or exit_code != 0:
+            self.failed.emit(f"MLFF calculation failed. Log: {self.job_dir / 'worker.log'}\n{self._tail}")
+            return
         try:
-            dyn.run(fmax=fmax, steps=nmax)
+            result = read_result(self.job_dir)
+            self.phonon = phonopy.load(str(self.job_dir / "phonopy.yaml"))
+            self.nx, self.ny, self.nz = result["supercell"]
+            for name in ARTIFACTS:
+                staged = self.workdir / (name + ".inspired-tmp")
+                shutil.copy2(self.job_dir / name, staged)
+                staged.replace(self.workdir / name)
+            (self.workdir / "FORCE_SETS").unlink(missing_ok=True)
+            write_json(self.workdir / "mlff-result.json", result)
         except Exception as error:
-            print("ERROR: Simulation failed.", error)
+            self.phonon = None
+            self.failed.emit(f"Could not load MLFF results from {self.job_dir}: {error}")
             return
-        atoms_relaxed = dyn.atoms.copy()
-        write("POSCAR-unitcell", atoms_relaxed, direct=True, format="vasp")
-        print("INFO: Structural optimization finished.")
+        self.completed.emit(result)
 
-        # Phonon calculator
-        npc = len(struc.numbers)
-        nsc = npc * nx * ny * nz
-        print("INFO: Number of atoms in unit cell: " + str(npc))
-        print("INFO: Supercell dimension: " + " ".join(map(str, [nx, ny, nz])))
-        print("INFO: Total number of atoms in supercell: " + str(nsc))
+    def plot_results(self):
+        """Plot the labelled dispersion and DOS exactly as the DFT workflow does."""
+        if self.phonon is None:
+            raise RuntimeError("Run the MLFF phonon calculation first.")
+        plot_band_structure_and_dos(self.phonon).show()
 
-        unitcell, _ = read_crystal_structure("POSCAR-unitcell", interface_mode="vasp")
-        self.phonon = Phonopy(
-            unitcell,
-            supercell_matrix=[self.nx, self.ny, self.nz],
-            primitive_matrix=np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
+    def generate_initial_mesh_file(self, mesh_list=(1, 1, 1)):
+        """Write the standard mesh input for subsequent OCLIMAX calculations."""
+        if not all((self.nx, self.ny, self.nz)):
+            raise RuntimeError("Complete a phonon calculation first.")
+        content = (
+            f"DIM = {self.nx} 0 0 0 {self.ny} 0 0 0 {self.nz}\n\n"
+            f"MP = {' '.join(map(str, mesh_list))}\n"
+            "FC_SYMMETRY = .TRUE.\nGAMMA_CENTER = .TRUE.\nEIGENVECTORS = .TRUE.\nFORCE_CONSTANTS = READ\n"
         )
+        (self.workdir / "mesh.conf").write_text(content, encoding="utf-8")
+        self.oclimax.oclimax_params.get_default_mesh()
+        self.oclimax.use_default_mesh()
 
-        # Phonon calculation with ASE
-        """
-        supercell = (self.nx, self.ny, self.nz)
-        ph = Phonons(atoms_relaxed, calculator, supercell=supercell, delta=delta)
-        print('INFO: Running phonon calculation. Expect '+str(nsc)+'x6 cache.json files in ./phonon when completed.')
-        print('INFO: Check phonon folder in working directory for progress. Press Ctrl+C in terminal to abort.')
-        try:
-            ph.run()
-        except:
-            print('ERROR: Phonon calculation failed or terminated.')
-            return
-
-        # Read forces and assemble the dynamical matrix
-        ph.read(acoustic=True)
-        ph.clean()
-
-        fcs = ph.get_force_constant()
-
-        #print(len(fcs),len(fcs[0]),len(fcs[0][0]))
-
-        force_constants = np.zeros((npc,nsc,3,3))
-        for i in range(npc):
-            for ix in range(nx):
-                for iy in range(ny):
-                    for iz in range(nz):
-                        k = ix+iy*nx+iz*nx*ny
-                        for j in range(npc):
-                            force_constants[i,j*nx*ny*nz+k] = fcs[k,3*i:3*i+3,3*j:3*j+3]
-
-        phonon.force_constants = force_constants
-        """
-
-        # Phonon calculation with phonopy
-
-        self.phonon.generate_displacements(distance=delta)
-        supercells = self.phonon.supercells_with_displacements
-        ns = len(supercells)
-        print("INFO: Total number of displacements: " + str(ns))
-
-        sets_of_forces = []
-        for i in range(ns):
-            supercell = supercells[i]
-            sc = Atoms(
-                symbols=supercell.get_chemical_symbols(),
-                scaled_positions=supercell.get_scaled_positions(),
-                cell=supercell.get_cell(),
-                pbc=True,
-            )
-            calculator.calculate(atoms=sc, properties="forces")
-            sets_of_forces.append(calculator.results["forces"])
-            if i < ns - 1:
-                print(
-                    "INFO: " + str(i + 1) + " of " + str(ns) + " displacements finished",
-                    end="\r",
-                )
-            else:
-                print("INFO: " + str(i + 1) + " of " + str(ns) + " displacements finished")
-
-        self.phonon.forces = sets_of_forces
-        self.phonon.produce_force_constants()
-
-        if os.path.isfile("BORN"):
-            print("INFO: BORN file found in the current folder.")
-            print("INFO: Unless it is there on purpose to include NAC, please remove it.")
-            nac_params = parse_BORN(self.phonon.primitive, filename="BORN")
-            nac_params["factor"] = 14.4
-            self.phonon.set_nac_params(nac_params)
-        try:
-            os.remove("FORCE_SETS")
-        except OSError:
-            pass
-        write_FORCE_CONSTANTS(
-            self.phonon.get_force_constants(),
-            p2s_map=self.phonon.primitive.get_primitive_to_supercell_map(),
-        )
-        print("INFO: Phonon calculation finished.")
-        print("INFO: Plotting phonon dispersion and DOS. For large unitcells this may take a few moments.")
-        print("INFO: Frequency unit in plot is THz. 1 THz = 4.136 meV = 33.356 cm-1")
-        print("INFO: Phonon DOS data will be saved in total_dos.dat file")
-        with contextlib.redirect_stderr(io.StringIO()) as f:
-            bands, labels, path_connections = get_band_qpoints_by_seekpath(self.phonon.primitive, 1, is_const_interval=True)
-        points = []
-        for i in range(len(bands)):
-            if i == 0 or (bands[i - 1][1] != bands[i][0]).any():
-                points.append(bands[i][0])
-            points.append(bands[i][1])
-        print("INFO: Labels for the special points in phonon dispersion:")
-        for i in range(len(labels)):
-            print(labels[i], points[i])
-
-        # To plot DOS next to band structure
-        self.phonon.auto_band_structure()
-        self.phonon.auto_total_dos()
-        self.phonon.write_total_dos()
-        self.phonon.plot_band_structure_and_dos().show()
-
-    def generate_initial_mesh_file(self, mesh_list=[1, 1, 1]):
-        """Generate mesh.conf file for MLFF calculation"""
-        if self.nx and self.ny and self.nz:
-            if os.path.isfile("BORN"):
-                print("INFO: BORN file found in the current folder.")
-                print("INFO: Unless it is there on purpose to include NAC, please remove it.")
-            try:
-                os.remove("FORCE_SETS")
-            except OSError:
-                pass
-            mf = open("mesh.conf", "w")
-            mf.write("DIM = " + str(self.nx) + " 0 0 0 " + str(self.ny) + " 0 0 0 " + str(self.nz) + "\n")
-            mf.write("\n")
-            mf.write(" ".join(["MP =", " ".join(list(map(str, mesh_list))), "\n"]))
-            mf.write("FC_SYMMETRY = .TRUE. \n")
-            mf.write("GAMMA_CENTER = .TRUE. \n")
-            mf.write("EIGENVECTORS = .TRUE. \n")
-            mf.write("FORCE_CONSTANTS = READ \n")
-            mf.close()
-            self.oclimax.oclimax_params.get_default_mesh()
-            self.oclimax.use_default_mesh()
-        else:
-            print("INFO: Please run phonon calculation first before setting up INS calculation.")
-
-    def gen_bandyaml_for_visualization(self):
-
+    def generate_band_yaml(self):
+        """Generate visualization data from the completed model without ML imports."""
+        if self.phonon is None:
+            raise RuntimeError("Run the MLFF phonon calculation first.")
         self.phonon.auto_band_structure(npoints=11, with_eigenvectors=True, write_yaml=True)
-
-    def gen_model_visualization_mlff(self, is_gamma_only=True, is_jmol=True):
-
-        # check if gamma.phonon file exists
-        if is_gamma_only and is_jmol:
-            if os.path.exists("out_gamma.phonon"):
-                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
-            else:
-                if os.path.exists("band.yaml"):
-                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
-                else:
-                    self.gen_bandyaml_for_visualization()
-                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
-
-                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
-        
-        if is_jmol == False:
-            if os.path.exists("band.yaml"):
-                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)
-
-            else:
-                self.gen_bandyaml_for_visualization()
-                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)

@@ -1,16 +1,13 @@
-import contextlib
-import io
 import os
 import re
 import shutil
-import subprocess
 
 import pandas as pd
 import phonopy
 from phonopy.file_IO import parse_BORN
-from phonopy.phonon.band_structure import get_band_qpoints_by_seekpath
 
 from inspired.gui.oclimax import OCLIMAX
+from inspired.phonon_plot import plot_band_structure_and_dos
 
 
 class DFTWorker:
@@ -95,82 +92,33 @@ class DFTWorker:
         self.oclimax.use_default_mesh()
 
     def plot_dos_dispersion(self):
-        self.oclimax.oclimax_params.get_supercell()
         print("INFO: Plotting phonon dispersion and DOS. For large unitcells this may take a few moments.")
         print("INFO: Frequency unit in plot is THz. 1 THz = 4.136 meV = 33.356 cm-1")
         print("INFO: Phonon DOS data will be saved in total_dos.dat file")
+        phonon = self._load_phonon()
+        # total_dos.dat keeps the input-cell normalization; only the plot uses the primitive cell.
+        phonon.auto_total_dos()
+        phonon.write_total_dos()
+        plot_band_structure_and_dos(phonon).show()
+
+    def plot_spec_dft(self):
+        self.oclimax.plot_spec()
+
+    def generate_band_yaml(self):
+        """Generate the eigenvector data consumed by visualization tools."""
+        phonon = self._load_phonon()
+        phonon.auto_band_structure(npoints=11, with_eigenvectors=True, write_yaml=True)
+
+    def _load_phonon(self):
+        """Load the current DFT model with the configured supercell and NAC."""
+        self.oclimax.oclimax_params.get_supercell()
         phonon = phonopy.load(
             supercell_matrix=self.oclimax.oclimax_params.supercell,
             primitive_matrix=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
             unitcell_filename="POSCAR-unitcell",
         )
-
         if os.path.isfile("BORN"):
             nac_params = parse_BORN(phonon.primitive, filename="BORN")
             nac_params["factor"] = 14.4
-            phonon.set_nac_params(nac_params)
-        with contextlib.redirect_stderr(io.StringIO()) as f:
-            bands, labels, path_connections = get_band_qpoints_by_seekpath(phonon.primitive, 1, is_const_interval=True)
-        points = []
-        for i in range(len(bands)):
-            if i == 0 or (bands[i - 1][1] != bands[i][0]).any():
-                points.append(bands[i][0])
-            points.append(bands[i][1])
-        print("INFO: Labels for the special points in phonon dispersion:")
-        for i in range(len(labels)):
-            print(labels[i], points[i])
-
-        # To plot DOS next to band structure
-        phonon.auto_band_structure()
-        phonon.auto_total_dos()
-        phonon.write_total_dos()
-        phonon.plot_band_structure_and_dos().show()
-
-    def plot_spec_dft(self):
-        self.oclimax.plot_spec()
-
-    def gen_bandyaml_for_visualization(self):
-        self.oclimax.oclimax_params.get_supercell()
-        print('INFO: Generating files for visualization. For large unitcells this may take a few moments.')
-        phonon = phonopy.load(supercell_matrix=self.oclimax.oclimax_params.supercell,
-                    primitive_matrix=[[1,0,0], [0,1,0], [0,0,1]],
-                    unitcell_filename="POSCAR-unitcell")
-
-        if os.path.isfile('BORN'):
-            nac_params = parse_BORN(phonon.primitive, filename="BORN")
-            nac_params['factor'] = 14.4
-            phonon.set_nac_params(nac_params)
-        with contextlib.redirect_stderr(io.StringIO()) as f:
-            bands, labels, path_connections = get_band_qpoints_by_seekpath(phonon.primitive, 1, is_const_interval=True)
-        points = []
-        for i in range(len(bands)):
-            if i==0 or (bands[i-1][1]!=bands[i][0]).any():
-                points.append(bands[i][0])
-            points.append(bands[i][1])
-        print('INFO: Labels for the special points in phonon dispersion:')
-        for i in range(len(labels)):
-            print(labels[i],points[i])
-        phonon.auto_band_structure(npoints=11, with_eigenvectors=True, write_yaml=True)
-
-    def gen_model_visualization_dft(self, is_gamma_only=True, is_jmol=True):
-
-        # check if gamma.phonon file exists
-        if is_gamma_only and is_jmol:
-            if os.path.exists("out_gamma.phonon"):
-                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
-            else:
-                if os.path.exists("band.yaml"):
-                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
-                else:
-                    self.gen_bandyaml_for_visualization()
-                    subprocess.run(["oclimax_convert", "-yamld", "band.yaml", "-p"], text=True)
-
-                subprocess.run(["java", "-jar", "/home/xb2/Programs/Jmol/jmol-16.3.55/Jmol.jar", "out_gamma.phonon"], text=True)
-        
-        if is_jmol == False:
-            if os.path.exists("band.yaml"):
-                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)
-
-            else:
-                self.gen_bandyaml_for_visualization()
-                subprocess.run(["firefox", "https://henriquemiranda.github.io/phononwebsite/phonon.html"], text=True)
+            phonon.nac_params = nac_params
+        return phonon

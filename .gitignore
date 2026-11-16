@@ -161,4 +161,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .pixi
-.envrc# pixi environments
+.envrc
+
+# MLFF job directories created inside working directories
+.inspired-jobs/

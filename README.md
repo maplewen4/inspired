@@ -175,7 +175,7 @@ INSPIRED can also be installed locally on your personal computer. The current ve
 
 ### Package versions
 
-MLFF models in v0.4.2 and later (Option 1) only include MatterSim and SevenNet. To use other MLFF models such as MACE, MACE-OFF, and ORB, install v0.4.1 with conda (Option 2).
+Published v0.4.2 includes MatterSim and SevenNet. This development checkout runs MLFFs in separate environments and also provides adapters for ORB v3, MACE, and MACE-OFF. See the setup instructions below.
 
 
 ## Additional notes:
@@ -190,6 +190,79 @@ https://matbench-discovery.materialsproject.org/
 
 https://iopscience.iop.org/article/10.1088/2632-2153/adfa68
 
+
+## INS simulation (OCLIMAX)
+
+**Run INS simulation** (DFT and MLFF tabs) runs in the background. A progress window shows the current step, for example each cycle of a single-crystal calculation. **Cancel** in that window stops the run, including the OCLIMAX programs it started. A cancelled or failed run keeps the previous result available for plotting. Detailed output still appears in the terminal.
+
+The phonon calculation uses the files in the working directory:
+
+- `POSCAR-unitcell`, `mesh.conf`, and `FORCE_SETS` or `FORCE_CONSTANTS` are required.
+- If a `BORN` file is present, the non-analytical term correction (NAC, LO-TO splitting) is applied to both powder and single-crystal simulations. To switch it off, add `NAC = .FALSE.` to `mesh.conf`.
+- `mesh.conf` may contain `DIM`, `MP` (or `MESH`), `GAMMA_CENTER`, `EIGENVECTORS`, `FC_SYMMETRY`, `FORCE_CONSTANTS`, `NAC`, and an identity `PRIMITIVE_AXES`. Any other setting stops the run with a message naming it, so no setting is silently ignored.
+
+Single-crystal simulations always symmetrize the force constants. Earlier versions skipped this step because of a typo. Compared with those versions, S(Q,E) results lose a spurious intensity peak at zero energy next to Bragg points, which also spread to roughly 1.5 meV. Results elsewhere are essentially unchanged.
+
+**Plot phonon dispersion and DOS** shows the dispersion on the standard primitive cell with labelled high-symmetry points, for both DFT and MLFF results. When the input cell is a conventional cell, this avoids folded, duplicated branches. INS simulations and exported files still use the input cell.
+
+## Phonon visualization
+
+After loading a DFT model or completing an MLFF phonon calculation, INSPIRED can prepare visualization files from either workflow:
+
+- **Open in Jmol (Gamma point)** creates `out_gamma.phonon` with the bundled OCLIMAX converter and opens the Gamma-point modes in Jmol.
+- **Open Phonon Website** creates `band.yaml`, opens the system's default browser, and shows the exact file to upload in the status bar.
+
+Generated files are reused until a structure, force-constant, or phonon configuration file becomes newer. This avoids unnecessary recalculation without showing stale results.
+
+For Jmol, either install a `jmol` executable on `PATH`, or point INSPIRED to a downloaded Jmol archive:
+
+```bash
+export INSPIRED_JMOL_JAR=/path/to/Jmol.jar
+inspired
+```
+
+Java must be available on `PATH` when using a Jmol archive. The Phonon Website integration uses the configured default browser instead of requiring Firefox.
+
+## Development
+
+### Independent MLFF environments
+
+The GUI and direct predictor use the root Pixi environment. Each MLFF family has an independent manifest and lockfile under `src/inspired/mlff/environments/`. Installing one backend does not change the GUI's PyTorch or other model environments. MACE and MACE-OFF share one environment.
+
+From the repository root, install the models you want:
+
+```bash
+pixi install --manifest-path src/inspired/mlff/environments/mattersim/pixi.toml --locked
+pixi install --manifest-path src/inspired/mlff/environments/sevennet/pixi.toml --locked
+pixi install --manifest-path src/inspired/mlff/environments/mace/pixi.toml --locked
+pixi install --manifest-path src/inspired/mlff/environments/orb/pixi.toml --locked
+pixi run inspired
+```
+
+The model selector shows whether the corresponding environment's interpreter is installed. Selecting an uninstalled model shows its setup command. This status checks interpreter presence; a calculator import probe provides a stronger check without downloading model weights:
+
+```bash
+pixi run --manifest-path src/inspired/mlff/environments/sevennet/pixi.toml --locked python src/inspired/mlff/runner.py --probe sevennet
+```
+
+Substitute the environment and backend (`mattersim`, `sevennet`, `orb`, `mace`, or `mace-off`) as needed. The supplied environments use CPU PyTorch as a portable baseline. To use an existing environment, including a compatible CUDA installation, set `INSPIRED_MATTERSIM_PYTHON`, `INSPIRED_SEVENNET_PYTHON`, `INSPIRED_ORB_PYTHON`, or `INSPIRED_MACE_PYTHON` to its absolute Python executable path before launching INSPIRED. The backend environment needs ASE, Phonopy 2.28, seekpath, and its model package. Workers select CUDA automatically when their PyTorch installation supports it.
+
+Each job loads its model once for relaxation and every phonon displacement. Progress appears in a cancellable dialog and the terminal. The original calculation button also cancels a running job. Shared calculation controls are disabled during a job to avoid mixing models or changing output directories.
+
+Jobs and logs are retained under `<working-directory>/.inspired-jobs/`. A successful job publishes `POSCAR-unitcell`, `FORCE_CONSTANTS`, `phonopy.yaml`, `band.yaml`, `total_dos.dat`, and `mlff-result.json` into the working directory for plotting and OCLIMAX. Failed or cancelled worker calculations leave existing published files untouched. The result manifest records the model identifier, custom checkpoint SHA-256 when applicable, package versions, device, precision, and calculation options. Optimization must converge before phonon generation begins. Default model weights may be downloaded by the model library on first use; custom ORB checkpoints are not yet supported.
+
+To add a model, register it in `src/inspired/mlff/backends.py`, add its calculator factory and an independent environment, then resolve that environment's lockfile. The standalone runner and Qt controller communicate through the versioned JSON contract in `src/inspired/mlff/protocol.py`, without passing Python objects between environments. The integration tests exercise a complete subprocess phonon calculation using ASE's EMT potential, so they do not require downloading pretrained weights.
+
+Use the Pixi tasks for routine checks:
+
+```bash
+pixi run test
+pixi run lint
+```
+
+The INS simulation pipeline lives in `src/inspired/gui/oclimax_job.py`, which has no Qt dependency. The GUI runs it as `python -m inspired.gui.oclimax_job` in the working directory and reads `PROGRESS`, `RESULT`, and `ERROR:` lines from its output. Each job starts its own process group so that Cancel also stops the bundled binaries. Phonopy runs through its Python API in `src/inspired/gui/phonopy_steps.py`, not through the `phonopy` command. Tests check that its output matches the phonopy 2.28 command line. The shared dispersion plot is in `src/inspired/phonon_plot.py`.
+
+Visualization orchestration is isolated in `src/inspired/visualization.py`; DFT and MLFF workers only generate `band.yaml`. Add future visualization destinations there so caching, external-tool discovery, errors, and tests stay consistent. Edit `src/inspired/gui/inspired.ui` when changing the interface and keep the generated `ui_inspired.py` synchronized.
 
 ## Contact:
 

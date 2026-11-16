@@ -26,7 +26,10 @@ build-backend = "hatchling.build"
 source = "versioningit"
 
 [tool.hatch.build]
-artifacts = ["*.yml", "*.yaml", "*.json"]
+artifacts = ["*.yml", "*.yaml", "*.json", "!**/.pixi/**"]
+
+# Ship backend manifests and locks, never their locally installed environments.
+exclude = ["src/inspired/mlff/environments/**/.pixi", "**/__pycache__"]
 
 [tool.hatch.build.hooks.versioningit-onbuild]
 source-file = "src/inspired/_version.py"
@@ -50,6 +53,8 @@ distance-dirty = "{next_version}.dev{distance}"
 [tool.versioningit.write]
 file = "src/inspired/_version.py"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
@@ -119,10 +124,9 @@ torch-geometric = "*"
 torch-sparse = "*"
 torch-scatter = "*"
 torch-cluster = "*"
-sevenn = "*"
-#e3nn= "==0.5.0"
+ase = "*"
+e3nn = "==0.6.0"
 pyqt5 = "*"
-mattersim = ">=1.1.2"
 
 
 [tool.pixi.pypi-options]
@@ -151,6 +155,7 @@ pip-audit = ">=2.9.0"
 pre-commit = ">=4.2.0"
 ruff = "*"
 codecov = ">=2.1.13"
+pytest = ">=8"
 
 [tool.pixi.activation.env]
 OMP_NUM_THREADS  = "1"
@@ -167,6 +172,8 @@ conda-publish = { cmd = "anaconda upload *.conda", description = "Publish the .c
     "conda-build",
 ] }
 # Misc
+test = { cmd = "pytest", description = "Run the test suite" }
+lint = { cmd = "ruff check .", description = "Run static analysis" }
 audit-deps = { cmd = "pip-audit --local -s osv", description = "Audit the package dependencies for vulnerabilities" }
 clean = { cmd = 'rm -rf .ruff_cache **/*.egg-info **/dist **/__pycache__ **/_version.py', description = "Clean up various caches and build artifacts" }
 clean-conda = { cmd = "rm -f *.conda", description = "Clean the local .conda build artifacts" }

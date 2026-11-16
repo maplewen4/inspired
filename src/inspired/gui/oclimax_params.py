@@ -1,7 +1,53 @@
-import os
-import subprocess
+"""Initialize and access OCLIMAX parameters and the phonopy mesh.conf file."""
 
-# Initialize and access oclimax parameters
+import os
+from pathlib import Path
+
+MESH_CONF = "mesh.conf"
+# Phonopy accepts any of these tags for the sampling mesh.
+MESH_TAGS = ("MP", "MESH", "MESH_NUMBERS")
+
+
+def conf_key(line):
+    """Return the upper-case tag of a phonopy ``TAG = value`` line, or None."""
+    content = line.split("#", 1)[0]
+    if "=" not in content:
+        return None
+    return content.split("=", 1)[0].strip().upper()
+
+
+def conf_value(line):
+    """Return the value of a phonopy ``TAG = value`` line without comments."""
+    return line.split("#", 1)[0].split("=", 1)[1].strip()
+
+
+def find_conf_line(path, tags):
+    """Return the first line of *path* assigning one of *tags*, or None."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if conf_key(line) in tags:
+            return line.strip()
+    return None
+
+
+def set_mesh(path, mesh_list):
+    """Replace (or append) the sampling mesh in a phonopy configuration file."""
+    path = Path(path)
+    mesh = " ".join(str(value) for value in mesh_list)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        key = conf_key(line)
+        if key in MESH_TAGS:
+            lines[index] = f"{key} = {mesh}"
+            replaced = True
+    if not replaced:
+        lines.append(f"MP = {mesh}")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 class OclimaxParams:
@@ -59,73 +105,61 @@ class OclimaxParams:
         self.supercell = None
 
     def get_supercell(self):
-        if os.path.isfile("mesh.conf"):
-            sc = subprocess.run(
-                ["sed -n '/^DIM/p' mesh.conf"],
-                shell=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            scm = list(map(int, sc.split("=")[1].split()))
-            if len(scm) == 9:
-                self.supercell = [
-                    [scm[0], scm[1], scm[2]],
-                    [scm[3], scm[4], scm[5]],
-                    [scm[6], scm[7], scm[8]],
-                ]
-            elif len(scm) == 3:
-                self.supercell = scm
-            else:
-                print("Check supercell dimension in mesh.conf file.")
-        else:
+        line = find_conf_line(MESH_CONF, ("DIM",))
+        if line is None:
             print(
-                "ERROR: Could not open/read mesh.conf file. This file is required to continue the calculation correctly."
+                "ERROR: Could not find DIM in mesh.conf. This file is required to continue the calculation correctly."
             )
+            return
+        try:
+            scm = [int(value) for value in conf_value(line).split()]
+        except ValueError:
+            scm = []
+        if len(scm) == 9:
+            self.supercell = [scm[0:3], scm[3:6], scm[6:9]]
+        elif len(scm) == 3:
+            self.supercell = scm
+        else:
+            print("ERROR: Check supercell dimension in mesh.conf file.")
 
     def get_default_mesh(self):
-        if os.path.isfile("mesh.conf"):
-            mesh = subprocess.run(
-                [r"sed -n '/^MP\|^MESH/p' mesh.conf"],
-                shell=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            self.default_mesh = mesh.split("=")[1].split()[-3:]
-        else:
+        line = find_conf_line(MESH_CONF, MESH_TAGS)
+        if line is None:
             print(
-                "ERROR: Could not open/read mesh.conf file. This file is required to continue the calculation correctly."
+                "ERROR: Could not find MP/MESH in mesh.conf. This file is required to continue the calculation correctly."
             )
+            return
+        self.default_mesh = conf_value(line).split()[-3:]
 
-    def generate_mesh_file(self, mesh_list=["1", "1", "1"]):
-        if os.path.isfile("mesh.conf"):
-            newmesh = " ".join(mesh_list)
-            subprocess.run(["sed -i 's/.*MP.*/MP = " + newmesh + "/' mesh.conf"], shell=True)
-            subprocess.run(["sed -i 's/.*MESH.*/MESH = " + newmesh + "/' mesh.conf"], shell=True)
-        else:
+    def generate_mesh_file(self, mesh_list=("1", "1", "1")):
+        if not os.path.isfile(MESH_CONF):
             print(
                 "ERROR: Could not open/read mesh.conf file. This file is required to continue the calculation correctly."
             )
+            return
+        set_mesh(MESH_CONF, mesh_list)
 
     def load_parameters(self, params_file_path="oclimax.params"):
         try:
-            pf = open(params_file_path, "r")
+            with open(params_file_path, "r") as pf:
+                para_lines = pf.readlines()
         except OSError:
             print("INFO: Could not open/read params file, make sure it is in current working directory.")
             return
-        para_lines = pf.readlines()
-        pf.close()
         for s in para_lines:
             if s.startswith("#!"):
                 s = s[2:]
             param = [p.strip() for p in s.split("#", 1)[0].split("=", 1)]
             if len(param) == 2 and param[0] in list(self.dict_params.keys()):
                 if param[0] in ["TASK", "INSTR", "E_UNIT", "x-axis", "y-axis"]:
-                    self.dict_params[param[0]] = int(param[1])
+                    try:
+                        self.dict_params[param[0]] = int(param[1])
+                    except ValueError:
+                        print(f"WARNING: Ignoring non-integer {param[0]} value in {params_file_path}: {param[1]}")
                 else:
                     self.dict_params[param[0]] = param[1]
 
     def write_new_parameter_file(self, save_params_file_path="oclimax.params"):
-        pf = open(save_params_file_path, "w")
         list_file_lines = []
         list_file_lines.append("# This file was generated by INSPIRED and should be used within INSPIRED.")
         list_file_lines.append(
@@ -177,10 +211,8 @@ class OclimaxParams:
         list_file_lines.append("#! x-axis =   " + str(self.dict_params["x-axis"]))
         list_file_lines.append("#! y-axis =   " + str(self.dict_params["y-axis"]))
 
-        file_content = "\n".join(list_file_lines)
-        pf.write(file_content)
-
-        pf.close()
+        with open(save_params_file_path, "w") as pf:
+            pf.write("\n".join(list_file_lines))
 
     def update_param(self, param_key, param):
         self.dict_params[param_key] = param

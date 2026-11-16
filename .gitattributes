@@ -1,2 +1,8 @@
 # SCM syntax highlighting & preventing 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true
+
+# Qt Designer sources use the repository's existing CRLF convention.
+*.ui whitespace=cr-at-eol
+
+# This legacy worker is also stored with CRLF line endings.
+src/inspired/gui/dft_worker.py whitespace=cr-at-eol
